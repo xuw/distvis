@@ -212,5 +212,8 @@ body.visual-mode .workspace-heading,body.visual-mode #running-elsewhere{display:
   .element-popover textarea{min-height:40px}
   .element-popover{position:fixed;left:0!important;right:0;top:auto!important;bottom:0;width:auto;max-height:60vh;border-radius:14px 14px 0 0;box-shadow:0 -10px 40px #1d403233}
   .menu-content{max-width:calc(100vw - 24px)}
-  #network-menu .menu-content{min-width:0;width:min(300px,calc(100vw - 24px))}
+  /* Strip menus drop down across the whole strip, so they stay on screen wherever their button wraps to. */
+  .run-strip{position:relative}
+  .run-strip .more-menu{position:static}
+  .run-strip .menu-content,#network-menu .menu-content{left:8px;right:8px;top:100%;width:auto;min-width:0;max-width:none}
 }

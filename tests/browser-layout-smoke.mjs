@@ -126,6 +126,19 @@ try {
   assert.equal(await page.locator('#element-popover').isVisible(), false, 'the sheet is closed (0px) until a node is tapped');
   const small = await page.locator('.run-strip button:visible, .run-strip select:visible, .run-strip summary:visible').evaluateAll(els => els.map(el => ({ id: el.id || el.textContent.trim(), h: el.getBoundingClientRect().height, w: el.getBoundingClientRect().width })).filter(t => t.h < 36 || t.w < 36));
   assert.deepEqual(small, [], 'strip targets are at least 40px');
+  // Strip menus open fully inside the phone viewport, whichever row their button wrapped to.
+  for (const menu of ['#network-menu', '#run-details']) {
+    await page.locator(`${menu} > summary`).click();
+    const box = await rect(`${menu} .menu-content`);
+    assert.ok(box.left >= 0 && box.right <= 390, `${menu} stays inside the viewport (${box.left}..${box.right})`);
+    assert.ok(await noPageOverflow());
+    if (menu === '#network-menu') {
+      const heal = await rect('#heal-links'), history = await rect('#fault-history');
+      assert.ok(heal.left >= 0 && heal.right <= 390 && history.left >= 0 && history.right <= 390, 'heal and fault history are fully visible');
+    }
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator(`${menu}[open]`).count(), 0);
+  }
   await page.locator('#graph [data-node="node-1"]').click();
   const sheet = await rect('#element-popover');
   assert.ok(Math.abs(sheet.bottom - 844) <= 1 && sheet.height <= 844 * 0.6 + 1 && sheet.left <= 0.5 && sheet.right >= 389.5, 'popover becomes a bottom sheet');
