@@ -97,10 +97,17 @@ try {
   assert.equal(await page.locator('#popover-title').textContent(), 'node-1 ↔ node-2');
   await page.keyboard.press('Escape'); await page.keyboard.press('Escape');
 
-  // The input badge opens the popover with the cursor in the first field.
-  await page.locator('#graph [data-input-node="node-2"]').click();
-  assert.equal(await page.evaluate(() => document.activeElement?.name), 'number');
-  await page.keyboard.press('Escape');
+  // The input badge opens the popover with the cursor in the first field; closing returns to that badge,
+  // even after live redraws replaced the element.
+  async function badgeRoundTrip(close) {
+    await page.locator('#graph [data-input-node="node-2"]').click();
+    assert.equal(await page.evaluate(() => document.activeElement?.name), 'number');
+    await page.waitForTimeout(400);
+    if (close === 'Escape') await page.keyboard.press('Escape'); else await page.locator('#popover-close').click();
+    assert.equal(await page.locator('#element-popover').isVisible(), false);
+    assert.equal(await page.evaluate(() => document.activeElement?.dataset.inputNode), 'node-2', `${close} returns focus to the badge`);
+  }
+  await badgeRoundTrip('Escape'); await badgeRoundTrip('close');
 
   // Geometry follows the container without a resize feedback loop.
   await page.setViewportSize({ width: 1100, height: 900 });
@@ -123,12 +130,39 @@ try {
   const sheet = await rect('#element-popover');
   assert.ok(Math.abs(sheet.bottom - 844) <= 1 && sheet.height <= 844 * 0.6 + 1 && sheet.left <= 0.5 && sheet.right >= 389.5, 'popover becomes a bottom sheet');
   assert.ok(await noPageOverflow());
-  const smallInSheet = await page.locator('#element-popover button:visible, #element-popover input:visible:not([type=checkbox]), #element-popover select:visible').evaluateAll(els => els.map(el => ({ id: el.id || el.textContent.trim(), h: el.getBoundingClientRect().height })).filter(t => t.h < 36));
-  assert.deepEqual(smallInSheet, [], 'sheet targets are at least 40px');
+  // Every interactive sheet control, including checkbox labels and disclosure summaries, is at least 40×40.
+  const sheetTargets = () => page.locator('#element-popover :is(button, input:not([type=checkbox]), select, textarea, summary, label.checkbox):visible')
+    .evaluateAll(els => els.map(el => { const r = el.getBoundingClientRect(); return { id: el.id || el.textContent.trim().slice(0, 20), w: r.width, h: r.height }; }));
+  const tooSmall = targets => targets.filter(t => t.w < 36 || t.h < 36);
+  const nodeTargets = await sheetTargets();
+  assert.ok(nodeTargets.some(t => t.id.startsWith('完整状态')), 'the raw-state summary is measured');
+  assert.deepEqual(tooSmall(nodeTargets), [], 'node sheet targets are at least 40px');
+  await page.locator('#peer-links [data-peer="node-2"]').click();
+  const linkTargets = await sheetTargets();
+  assert.ok(linkTargets.some(t => t.id.startsWith('中断')), 'the link checkbox label is measured');
+  assert.deepEqual(tooSmall(linkTargets), [], 'link sheet targets are at least 40px');
+  await page.keyboard.press('Escape');
   await page.screenshot({ path: 'artifacts/layout-mobile.png' });
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#element-popover').isVisible(), false);
   assert.equal(await page.evaluate(() => document.activeElement?.dataset.node), 'node-1');
+  await badgeRoundTrip('Escape'); await badgeRoundTrip('close');
+
+  // The phone drawer offers all navigation, API docs included, whatever the saved sidebar preference.
+  for (const preference of [null, 'false', 'true']) {
+    await page.evaluate(value => value === null ? localStorage.removeItem('distvis-sidebar-collapsed') : localStorage.setItem('distvis-sidebar-collapsed', value), preference);
+    await page.reload();
+    await page.waitForFunction(() => document.querySelectorAll('#graph .graph-node').length === 5);
+    await page.locator('#toggle-sidebar').click();
+    for (const target of ['#nav-library', '#create-experiment-side', '.sidebar-section', '#nav-guide']) {
+      assert.ok(await page.locator(target).isVisible(), `${target} in the phone drawer (preference ${preference})`);
+      assert.ok(await page.locator(target).isEnabled());
+    }
+    assert.notEqual(await page.locator('#recent-experiments').evaluate(el => getComputedStyle(el).display), 'none');
+    await page.keyboard.press('Escape');
+    assert.equal((await rect('.sidebar')).width, 0);
+    assert.equal(await page.evaluate(() => localStorage.getItem('distvis-sidebar-collapsed')), preference, 'the drawer never writes the preference');
+  }
   await stop(five);
 
   // Twelve nodes keep readable cards; below the minimum size the graph scrolls inside its area.

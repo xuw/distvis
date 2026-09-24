@@ -127,8 +127,19 @@ function snapshot() {
   return cache;
 }
 function hydrateLive() { liveState = emptyState(); for (const e of events) reduceEvent(liveState, e); liveRev++; }
+// The furthest status seen for each run, from any source (events, loads, stop replies, polls).
+// It outlives navigation, so a poll that started before a run ended cannot revive it later.
+const knownStatus = new Map();
+function noteStatus(runId, status) {
+  if (!runId || !(status in statusRank)) return knownStatus.get(runId);
+  const known = knownStatus.get(runId);
+  // The first terminal status wins; later reports cannot relabel a failed run as completed.
+  if (!known || statusRank[status] > statusRank[known] || (statusRank[status] === statusRank[known] && !terminalStatuses.has(known))) knownStatus.set(runId, status);
+  return knownStatus.get(runId);
+}
 function markActiveStatus(runId, status) {
-  for (const item of experiments) if (item.latestRun?.id === runId && statusRank[status] >= (statusRank[item.latestRun.status] ?? 0)) item.latestRun.status = status;
+  const best = noteStatus(runId, status);
+  for (const item of experiments) if (item.latestRun?.id === runId) item.latestRun.status = best;
 }
 const liveChanges = new Set(['node', 'fault', 'input_schema', 'command_result', 'command_error', 'lifecycle']);
 function receiveEvent(e) {
@@ -140,9 +151,8 @@ function receiveEvent(e) {
   if (liveChanges.has(e.type)) liveRev++;
   if (e.type === 'lifecycle' && run) {
     const next = { start: 'running', stop: 'completed', failed: 'failed' }[e.action];
-    // A late start must never revive a run that has already ended.
-    if (next && !(terminalStatuses.has(run.status) && next === 'running')) run.status = next;
-    markActiveStatus(run.id, run.status);
+    // Statuses only move forward, so a late start never revives a run that has already ended.
+    if (next) { noteStatus(run.id, run.status); markActiveStatus(run.id, next); run.status = knownStatus.get(run.id); }
   }
   if (live) { cursor = events.length; playTime = latestTime; }
   renderDirty = true;
@@ -153,6 +163,7 @@ async function openRun(id, asLive = false) {
   if (requestId !== loadingRun || result.config.experimentId !== experiment?.id) return;
   stream?.close();
   run = result; events = result.events; delete run.events;
+  run.status = noteStatus(run.id, run.status);
   ends.clear();
   sends.clear();
   for (const e of events) {
@@ -403,14 +414,28 @@ function currentTargetKey() {
   if (!run) return '';
   return linkSel ? `${run.id}:link:${pairKey(linkSel.a, linkSel.b)}` : `${run.id}:node:${selected}`;
 }
+function chosenAction(node = selected) {
+  const schema = nodeInputSchema(node), chosen = inputActions.get(inputDraftKey(node));
+  return schema.some(s => s.action === chosen) ? chosen : schema[0]?.action;
+}
+// Operation identities: an input action, a node's crash/recover toggle, or one direction of a link.
+function inputOperation(node, action) { return `${run.id}:node:${node}:input:${action}`; }
+function toggleOperation(node) { return `${run.id}:node:${node}:toggle`; }
+function linkOperation() { return `${run.id}:link:${pairKey(linkSel.a, linkSel.b)}:${linkSel.dir}`; }
+function visibleOperations() {
+  if (!run || !popoverOpen) return [];
+  if (linkSel) return [linkOperation()];
+  const action = chosenAction();
+  return [toggleOperation(selected), ...(action ? [inputOperation(selected, action)] : [])];
+}
 function isCurrent(token) {
-  return token.loadGen === loadingRun && run?.id === token.runId && (token.scope === 'run' || (popoverOpen && currentTargetKey() === token.target));
+  return token.loadGen === loadingRun && run?.id === token.runId && (token.scope === 'run' || visibleOperations().includes(token.key));
 }
 // Each request remembers the run, load generation and element it was sent for. A late reply
 // after the user switched runs or elements only clears its own pending flag.
 async function mutate({ key, path, body, fault = false, scope = 'target', success }) {
   if (!run) throw new Error('请先运行实验');
-  const token = { loadGen: loadingRun, runId: run.id, target: currentTargetKey(), scope };
+  const token = { loadGen: loadingRun, runId: run.id, key, scope };
   pending.add(key); if (fault) faultBusy++;
   if (isCurrent(token)) popoverError = null;
   renderDirty = true; render();
@@ -420,7 +445,7 @@ async function mutate({ key, path, body, fault = false, scope = 'target', succes
     return result;
   } catch (error) {
     if (isCurrent(token)) {
-      if (scope === 'target') popoverError = { target: token.target, message: error.message };
+      if (scope === 'target') popoverError = { target: key, message: error.message };
       notify(error.message);
     }
   } finally {
@@ -450,8 +475,7 @@ function applicationForm(s, values, chosen) {
 }
 function renderApplicationInput() {
   const panel = $('#application-panel'), node = selected, schema = nodeInputSchema(node), key = inputDraftKey(node);
-  let chosen = inputActions.get(key);
-  if (!schema.some(s => s.action === chosen)) chosen = schema[0]?.action;
+  const chosen = chosenAction(node);
   // Forms are rebuilt only when the node or its declared schema changes, so typing survives live updates.
   const stamp = `${key}:${JSON.stringify(schema)}`;
   // An IME composition in progress would be destroyed by a rebuild; wait until it ends.
@@ -474,7 +498,7 @@ function renderApplicationInput() {
   const reason = run.status !== 'running' ? '实验未运行，无法发送输入。' : !liveOnline(node) ? `${node} 当前离线，无法发送输入。` : '';
   for (const form of panel.querySelectorAll('form.application-form')) {
     form.hidden = form.dataset.action !== chosen;
-    form.querySelector('button[type="submit"]').disabled = !!reason || pending.has(`${run.id}:node:${node}:input:${form.dataset.action}`);
+    form.querySelector('button[type="submit"]').disabled = !!reason || pending.has(inputOperation(node, form.dataset.action));
   }
   $('#application-note').textContent = reason || (live ? '输入发送至实时节点，并记录在事件流和时空图中。' : '当前为回放；输入仍发送至正在运行的实时节点。');
   $('#application-note').classList.toggle('warning', !!reason);
@@ -516,7 +540,7 @@ $('#application-panel').addEventListener('submit', guard(async e => {
       } else values[f.name] = f.type === 'number' ? Number(el.value) : el.value;
     }
   }
-  await mutate({ key: `${run.id}:node:${node}:input:${action}`, path: `/api/runs/${run.id}/commands`, body: { node, action, values },
+  await mutate({ key: inputOperation(node, action), path: `/api/runs/${run.id}/commands`, body: { node, action, values },
     success: (result, current) => { if (current) notify(`应用输入已发送 · #${result.commandSeq}`); } });
 }));
 function faultBlockReason() {
@@ -532,7 +556,7 @@ function renderNodePopover(state) {
   const toggle = $('#node-toggle'), reason = faultBlockReason(), label = online ? '模拟崩溃' : '恢复节点';
   toggle.dataset.nodeAction = online ? 'crash' : 'recover';
   if (toggle.dataset.label !== label) { toggle.dataset.label = label; toggle.innerHTML = icon('bolt') + label; }
-  toggle.disabled = !!reason || pending.has(`${run.id}:node:${node}:toggle`);
+  toggle.disabled = !!reason || pending.has(toggleOperation(node));
   $('#node-toggle-note').textContent = reason || (live ? '作用于实时实验。' : '当前为回放；此操作作用于实时实验。');
   const peers = nodes().filter(p => p !== node).map(p => [p, liveState.links[pairKey(node, p)], liveState.links[pairKey(p, node)]]);
   const list = $('#peer-links'), peerStamp = JSON.stringify([run.id, node, peers]);
@@ -555,7 +579,11 @@ function renderNodePopover(state) {
 function linkRule(from, to) { return liveState.links[pairKey(from, to)]; }
 function linkEnds() { return linkSel.dir === 'ba' ? [linkSel.b, linkSel.a] : [linkSel.a, linkSel.b]; }
 function linkDraftKey() { return `${run.id}:${pairKey(linkSel.a, linkSel.b)}:${linkSel.dir}`; }
-function linkBase() { return JSON.stringify(linkRule(...linkEnds()) || null); }
+// A two-way edit overwrites both directions, so a change to either one must be noticed.
+function linkBase() {
+  const { a, b, dir } = linkSel;
+  return JSON.stringify(dir === 'both' ? [linkRule(a, b) || null, linkRule(b, a) || null] : linkRule(...linkEnds()) || null);
+}
 function fillLinkForm(values) { $('#link-latency').value = values.latency; $('#link-bandwidth').value = values.bandwidth; $('#link-blocked').checked = values.blocked; }
 function liveLinkValues() {
   const rule = linkRule(...linkEnds());
@@ -581,7 +609,7 @@ function renderLinkPopover() {
   $('#link-notice').hidden = dir !== 'both';
   $('#link-notice').textContent = JSON.stringify(ab || null) !== JSON.stringify(ba || null) ? '两个方向当前的规则不同；应用后两个方向都会被覆盖为下面的相同设置。' : '将同时应用到两个方向。';
   const reason = faultBlockReason();
-  $('#apply-link').disabled = !!reason || pending.has(`${run.id}:link:${pairKey(a, b)}`);
+  $('#apply-link').disabled = !!reason || pending.has(linkOperation());
   $('#link-note').textContent = reason || (live ? '作用于实时实验。' : '当前为回放；此设置作用于实时实验。');
 }
 function renderPopover(state) {
@@ -589,7 +617,7 @@ function renderPopover(state) {
   pop.hidden = !popoverOpen || !run;
   if (pop.hidden) return;
   $('#popover-node').hidden = !!linkSel; $('#popover-link').hidden = !linkSel; $('#popover-back').hidden = !linkSel;
-  const error = popoverError?.target === currentTargetKey() ? popoverError.message : '';
+  const error = visibleOperations().includes(popoverError?.target) ? popoverError.message : '';
   $('#popover-error').hidden = !error; $('#popover-error').textContent = error;
   if (linkSel) renderLinkPopover(); else renderNodePopover(state);
 }
@@ -767,7 +795,7 @@ function eventDetail(seq, { locate = true } = {}) {
 }
 function graphClick(e) {
   const badge = e.target.closest('[data-input-node]'), node = e.target.closest('[data-node]'), link = e.target.closest('[data-from]'), event = e.target.closest('[data-event]');
-  if (badge) openNodePopover(badge.dataset.inputNode, `[data-node="${badge.dataset.inputNode}"]`, true);
+  if (badge) openNodePopover(badge.dataset.inputNode, `[data-input-node="${badge.dataset.inputNode}"]`, true);
   else if (node) openNodePopover(node.dataset.node, `[data-node="${node.dataset.node}"]`);
   else if (event) eventDetail(event.dataset.event, { locate: false });
   else if (link) { popoverOrigin = `[data-from="${link.dataset.from}"][data-to="${link.dataset.to}"]`; openLinkPopover(link.dataset.from, link.dataset.to, 'graph'); }
@@ -855,7 +883,7 @@ $('#popover-back').onclick = () => { if (linkSel) openNodePopover(linkSel.origin
 $('#node-toggle').onclick = guard(async () => {
   if (!run || linkSel) return;
   const node = selected, action = $('#node-toggle').dataset.nodeAction;
-  await mutate({ key: `${run.id}:node:${node}:toggle`, fault: true, path: `/api/runs/${run.id}/faults`, body: { kind: action, node },
+  await mutate({ key: toggleOperation(node), fault: true, path: `/api/runs/${run.id}/faults`, body: { kind: action, node },
     success: (result, current) => { if (current) notify(action === 'crash' ? `${node} 已崩溃 · 实时实验` : `${node} 已恢复 · 实时实验`); } });
 });
 $('#peer-links').onclick = e => { const peer = e.target.closest('[data-peer]'); if (peer) openLinkPopover(selected, peer.dataset.peer, 'node'); };
@@ -880,13 +908,14 @@ $('#link-form').addEventListener('submit', guard(async e => {
   const latency = String($('#link-latency').value).trim(), bandwidth = String($('#link-bandwidth').value).trim();
   const valid = (text, min, max) => /^\d+$/.test(text) && Number(text) >= min && Number(text) <= max;
   if (!valid(latency, 0, 30000) || !valid(bandwidth, 1, 100000)) {
-    popoverError = { target: currentTargetKey(), message: '延迟须为 0–30000 的整数毫秒，带宽须为 1–100000 的整数 KiB/s。' };
+    popoverError = { target: linkOperation(), message: '延迟须为 0–30000 的整数毫秒，带宽须为 1–100000 的整数 KiB/s。' };
     renderDirty = true; render(); return;
   }
-  await mutate({ key: `${run.id}:link:${pairKey(a, b)}`, fault: true, path: `/api/runs/${run.id}/faults`,
+  await mutate({ key: linkOperation(), fault: true, path: `/api/runs/${run.id}/faults`,
     body: { kind: 'link', from, to, latency: Number(latency), bandwidth: Number(bandwidth), blocked: $('#link-blocked').checked, bidirectional: dir === 'both' },
     // Edits typed while the request was in flight are newer than what was sent; keep them.
-    success: (result, current) => { if (linkDrafts.get(key) === submitted) linkDrafts.delete(key); if (current) { if (!linkDrafts.has(key)) $('#link-form').dataset.key = ''; notify('链路设置已应用并归档'); } } });
+    // Only a reply the user is still looking at retires the draft, and only the exact draft that was sent.
+    success: (result, current) => { if (!current) return; if (linkDrafts.get(key) === submitted) { linkDrafts.delete(key); $('#link-form').dataset.key = ''; } notify('链路设置已应用并归档'); } });
 }));
 $('#heal-links').onclick = guard(async () => {
   if (!run) return;
@@ -918,11 +947,9 @@ $('#stop-run').onclick = guard(async () => {
   const token = { loadGen: loadingRun, runId: run.id, scope: 'run' };
   stopPending = true; renderDirty = true; render();
   try {
-    const info = await api(`/api/runs/${run.id}/stop`, {});
-    if (isCurrent(token)) {
-      if (terminalStatuses.has(info.status)) run.status = info.status;
-      markActiveStatus(run.id, run.status); notify('实验已结束，完整记录已保存');
-    }
+    const info = await api(`/api/runs/${token.runId}/stop`, {});
+    markActiveStatus(token.runId, info.status);
+    if (isCurrent(token)) { run.status = knownStatus.get(run.id); notify('实验已结束，完整记录已保存'); }
     await refreshRuns();
   } finally { stopPending = false; renderDirty = true; }
 });
@@ -975,11 +1002,12 @@ async function refreshRuns() {
   protocolProjects=parents;
   experiments=items;
   // A poll that started before a lifecycle event must not bring an ended run back to life.
-  if(run)markActiveStatus(run.id,run.status);
+  for(const item of experiments)if(item.latestRun)item.latestRun.status=noteStatus(item.latestRun.id,item.latestRun.status);
   renderLibrary();$('#connection-status').textContent='已连接';
   if(id!==experiment?.id)return;
+  for(const item of history)item.status=noteStatus(item.id,item.status);
   runs=history;$('#history-count').textContent=scopedRuns().length;
-  if(run){const current=runs.find(r=>r.id===run.id);if(current){if(statusRank[current.status]>=(statusRank[run.status]??0))run.status=current.status;markActiveStatus(run.id,run.status);latestTime=Math.max(latestTime,current.time);renderDirty=true;}}
+  if(run){const current=runs.find(r=>r.id===run.id);if(current){run.status=noteStatus(run.id,current.status);markActiveStatus(run.id,run.status);latestTime=Math.max(latestTime,current.time);renderDirty=true;}}
   if(workspaceView==='history')renderHistory();
 }
 function clearRun() {

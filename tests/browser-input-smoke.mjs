@@ -53,6 +53,13 @@ try {
   assert.ok((await page.locator('#event-summary').textContent()).length > 0);
   await page.locator('#event-dialog .close-dialog').click();
   await page.screenshot({ path: 'artifacts/application-input.png', fullPage: true });
+  // On a phone the same form is a bottom sheet; boolean labels and the JSON field are comfortable targets.
+  await page.setViewportSize({ width: 390, height: 844 });
+  const targets = await page.locator('#element-popover :is(button, input:not([type=checkbox]), select, textarea, summary, label.checkbox):visible')
+    .evaluateAll(els => els.map(el => { const r = el.getBoundingClientRect(); return { name: el.name || el.textContent.trim().slice(0, 20), w: r.width, h: r.height }; }));
+  assert.ok(targets.some(t => t.name === 'data') && targets.some(t => t.name.startsWith('启用')), 'the JSON field and the boolean label are measured');
+  assert.deepEqual(targets.filter(t => t.w < 36 || t.h < 36), [], 'sheet targets are at least 40px');
+  await page.setViewportSize({ width: 1440, height: 1100 });
   await api(`/api/runs/${run.id}/stop`, {});
   await page.waitForFunction(() => document.querySelector('#application-panel button').disabled);
   const archive = await api(`/api/runs/${run.id}/export`);

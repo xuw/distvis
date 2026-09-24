@@ -26,6 +26,15 @@ const request=(path,options={})=>new Promise(resolve=>{
 });
 const context={document,window,console,structuredClone,TextDecoder,Uint8Array,atob,fetch:request,localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)},setTimeout,clearTimeout,setInterval:(f)=>{intervals.push(f);return 1},requestAnimationFrame:f=>{frame=f},performance,location:{},MouseEvent:window.Event,Event:window.Event,FormData:class{constructor(form){this.data=Object.entries(form.elements).map(([k,v])=>[k,v.value])}*[Symbol.iterator](){yield* this.data}get(k){return this.data.find(v=>v[0]===k)?.[1]}},EventSource:class{constructor(url){this.url=url;streams.push(this)}close(){this.closed=true}}};
 vm.createContext(context);vm.runInContext(readFileSync(root+'/public/app.js','utf8'),context);
+// Controlled replies: held requests resolve only when a test releases them, possibly with stale data or a failure.
+const hold={get:false,post:false},heldGets=[],heldPosts=[];
+context.fetch=(path,options={})=>{
+ if(options.method==='POST'?hold.post:hold.get)return new Promise(resolve=>(options.method==='POST'?heldPosts:heldGets).push({path,options,resolve}));
+ return request(path,options);
+};
+const failReply={ok:false,status:500,json:async()=>({error:'模拟失败'})};
+async function releasePost(ok=true){const {path,options,resolve}=heldPosts.shift();resolve(ok?await request(path,options):failReply);await delay();}
+async function releaseGets(patch=(path,data)=>data){while(heldGets.length){const {path,resolve}=heldGets.shift();const data=patch(path,await (await request(path)).json());resolve({ok:true,status:200,json:async()=>data});}await delay();}
 let frameClock=0; const paint=()=>frame?.(frameClock+=200); const delay=()=>new Promise(r=>setTimeout(r,100));
 const click=async selector=>{const el=document.querySelector(selector);if(el.onclick)await el.onclick({target:el,preventDefault(){}});else el.dispatchEvent(new window.Event('click',{bubbles:true}));await delay();paint();};
 async function sync(){for(const stream of streams.filter(s=>!s.closed)){const path=stream.url.split('/events')[0];const result=await (await request(path)).json();for(const e of result.events)stream.onmessage?.({data:JSON.stringify(e)});}paint();}
@@ -132,6 +141,69 @@ vm.runInContext("pendingHeal=document.querySelector('#heal-links').onclick();loa
 await vm.runInContext('pendingHeal',context);await delay();await sync();
 assert.equal(document.querySelector('#toast').textContent,'','no notice for a run the user left');
 assert.equal(vm.runInContext('pending.size + faultBusy',context),0,'pending state is released');
+// A late failure for one input action must not appear after the user switched to another action.
+vm.runInContext("savedSchemas=liveState.schemas['node-1'];liveState.schemas['node-1']=[{action:'first',label:'First',fields:[]},{action:'second',label:'Second',fields:[]}];liveRev++;openNodePopover('node-1');",context);
+document.querySelector('#toast').textContent='';hold.post=true;
+document.querySelector('#application-panel form[data-action="first"]').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
+await delay();hold.post=false;
+vm.runInContext("inputActions.set(inputDraftKey('node-1'),'second');renderDirty=true;render();",context);
+await releasePost(false);paint();
+assert.equal(document.querySelector('#popover-error').hidden,true,'no stale error for the action the user left');
+assert.equal(document.querySelector('#toast').textContent,'','no stale notice for the action the user left');
+vm.runInContext("inputActions.set(inputDraftKey('node-1'),'first');renderDirty=true;render();",context);
+assert.equal(document.querySelector('#popover-error').hidden,true);
+vm.runInContext("liveState.schemas['node-1']=savedSchemas;liveRev++;renderDirty=true;render();",context);
+// Same for a link direction: a late failure for node-1 → node-2 stays silent once node-2 → node-1 is shown.
+await click('#peer-links [data-peer="node-2"]');
+hold.post=true;document.querySelector('#link-form').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
+await delay();hold.post=false;
+await click('#dir-ba');
+await releasePost(false);paint();
+assert.equal(document.querySelector('#popover-error').hidden,true,'no stale error for the direction the user left');
+assert.equal(document.querySelector('#toast').textContent,'');
+// A dirty draft survives a success that arrives after the user moved to another element and then another run.
+await click('#dir-ab');
+document.querySelector('#link-latency').value='777';document.querySelector('#link-latency').dispatchEvent(new window.Event('input',{bubbles:true}));
+hold.post=true;document.querySelector('#link-form').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
+await delay();hold.post=false;
+vm.runInContext("openNodePopover('node-3');loadingRun++;",context);
+await releasePost(true);await sync();
+vm.runInContext("openNodePopover('node-1');openLinkPopover('node-1','node-2','node');",context);paint();
+assert.equal(document.querySelector('#link-latency').value,'777','the stale success did not retire the draft');
+assert.equal(document.querySelector('#link-changed').hidden,false,'the applied rule is reported as a live change');
+await click('#link-use-latest');
+// A two-way draft watches both directions: a change to the reverse rule alone is reported.
+await click('#dir-both');
+document.querySelector('#link-latency').value='555';document.querySelector('#link-latency').dispatchEvent(new window.Event('input',{bubbles:true}));
+vm.runInContext("liveState.links['node-2>node-1']={latency:99,bandwidth:5,blocked:false};liveRev++;renderDirty=true;render();",context);
+assert.equal(document.querySelector('#link-changed').hidden,false,'reverse-only change is noticed');
+document.querySelector('#link-latency').value='556';document.querySelector('#link-latency').dispatchEvent(new window.Event('input',{bubbles:true}));paint();
+assert.equal(document.querySelector('#link-latency').value,'556');
+assert.equal(document.querySelector('#link-changed').hidden,false,'the notice survives further typing');
+await click('#link-use-latest');
+assert.equal(document.querySelector('#link-changed').hidden,true,'use latest resets the baseline');
+assert.notEqual(document.querySelector('#link-latency').value,'556');
+vm.runInContext("delete liveState.links['node-2>node-1'];liveRev++;closePopover();",context);
+// A poll that started while this run was active must not revive it after it ended and the user left it.
+const endedRunId=vm.runInContext('run.id',context);
+hold.get=true;const stalePoll=vm.runInContext('refreshRuns()',context);await delay();hold.get=false;
+await request(`/api/runs/${endedRunId}/stop`,{method:'POST',body:'{}'});await sync();
+assert.equal(vm.runInContext('run.status',context),'completed');
+vm.runInContext('clearRun()',context);
+const asRunning=(path,data)=>path==='/api/experiments'?data.map(e=>e.latestRun?.id===endedRunId?{...e,latestRun:{...e.latestRun,status:'running'}}:e):Array.isArray(data)?data.map(r=>r.id===endedRunId?{...r,status:'running'}:r):data;
+await releaseGets(asRunning);await stalePoll;paint();
+assert.equal(vm.runInContext(`experiments.find(e=>e.id===experiment.id).latestRun.status`,context),'completed','the stale poll did not revive the ended run');
+assert.equal(vm.runInContext('runControlState().mode',context),'run');
+// An older poll is dropped when a newer one has already been applied; a genuinely new running ID is still found.
+hold.get=true;const olderPoll=vm.runInContext('refreshRuns()',context);await delay();const older=heldGets.splice(0);hold.get=false;
+await vm.runInContext('refreshRuns()',context);
+heldGets.push(...older);await releaseGets((path,data)=>path==='/api/experiments'?data.map(e=>({...e,name:'stale'})):data);await olderPoll;
+assert.notEqual(vm.runInContext('experiments.find(e=>e.id===experiment.id).name',context),'stale','older responses are discarded');
+hold.get=true;const freshPoll=vm.runInContext('refreshRuns()',context);await delay();hold.get=false;
+await releaseGets((path,data)=>path==='/api/experiments'?data.map(e=>e.id===vm.runInContext('experiment.id',context)?{...e,latestRun:{id:'brand-new-run',status:'running',createdAt:new Date().toISOString()}}:e):data);await freshPoll;paint();
+assert.equal(vm.runInContext('runControlState().mode',context),'goto','a new running ID is discoverable');
+await vm.runInContext('refreshRuns()',context);
+await vm.runInContext(`openRun('${endedRunId}')`,context);await delay();paint();
 await click('#stop-run');await sync();assert.equal(document.querySelector('#run-status').textContent,'已结束');
 assert.equal(document.querySelector('#new-run').textContent.trim(),'重新运行','an ended run offers to run again');
 // Another active run of the same experiment wins over "run again", and a replay never stops it.
@@ -140,11 +212,13 @@ assert.equal(document.querySelector('#new-run').textContent.trim(),'前往运行
 assert.equal(document.querySelector('#stop-run').hidden,true);
 vm.runInContext("experiments.find(e=>e.id===experiment.id).latestRun={id:run.id,status:'completed'};renderDirty=true;render();",context);
 // A startup failure arrives as a lifecycle event; a late start event cannot revive the run.
-vm.runInContext("run.status='starting';receiveEvent({seq:events.at(-1).seq+1,time:latestTime,type:'lifecycle',action:'failed'});receiveEvent({seq:events.at(-1).seq+1,time:latestTime,type:'lifecycle',action:'start'});render();",context);
+vm.runInContext("endedRun=run;run={...run,id:'failing-run',status:'starting'};receiveEvent({seq:events.at(-1).seq+1,time:latestTime,type:'lifecycle',action:'failed'});receiveEvent({seq:events.at(-1).seq+1,time:latestTime,type:'lifecycle',action:'start'});render();",context);
 assert.equal(vm.runInContext('run.status',context),'failed');
 assert.equal(document.querySelector('#run-status').textContent,'启动失败');
 assert.equal(document.querySelector('#view-error').hidden,false);
-vm.runInContext("run.status='completed';renderDirty=true;render();",context);
+vm.runInContext("receiveEvent({seq:events.at(-1).seq+1,time:latestTime,type:'lifecycle',action:'stop'});",context);
+assert.equal(vm.runInContext('run.status',context),'failed','the first terminal status wins');
+vm.runInContext("run=endedRun;renderDirty=true;render();",context);
 await click('#nav-history');assert.equal(document.querySelectorAll('.history-row').length,1);
 const historyButton=document.querySelector('[data-history]');await document.querySelector('#history-list').onclick({target:historyButton});await delay();paint();assert.equal(document.querySelector('#event-count').textContent,'0');
 await click('#nav-code');assert.match(document.querySelector('#source-editor').value,/lab.Main/);
