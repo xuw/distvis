@@ -192,6 +192,13 @@ assert.equal(new Set([abStamp,baStamp,bothStamp]).size,3,'each link direction is
 assert.match(bothStamp,/"dir":"both"/);
 vm.runInContext("delete liveState.links['node-2>node-1'];liveRev++;closePopover();",context);
 assert.match(stampNow(),/:null:/,'a closed popover is part of the stamp');
+// A stop request that fails after the user left the run stays silent.
+document.querySelector('#toast').textContent='';
+hold.post=true;const stopRequest=vm.runInContext("document.querySelector('#stop-run').onclick()",context);await delay();hold.post=false;
+vm.runInContext('loadingRun++',context);
+await releasePost(false);await stopRequest;paint();
+assert.equal(document.querySelector('#toast').textContent,'','no stale stop failure notice');
+assert.equal(vm.runInContext('stopPending',context),false,'the stop button is released');
 // A poll that started while this run was active must not revive it after it ended and the user left it.
 const endedRunId=vm.runInContext('run.id',context);
 hold.get=true;const stalePoll=vm.runInContext('refreshRuns()',context);await delay();hold.get=false;

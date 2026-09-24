@@ -956,6 +956,9 @@ $('#stop-run').onclick = guard(async () => {
     markActiveStatus(token.runId, info.status);
     if (isCurrent(token)) { run.status = knownStatus.get(run.id); notify('实验已结束，完整记录已保存'); }
     await refreshRuns();
+  } catch (error) {
+    // A failure for a run the user has already left is not reported on the page they are now on.
+    if (isCurrent(token)) notify(error.message);
   } finally { stopPending = false; renderDirty = true; }
 });
 $('#export-run').onclick = () => { if (run) location.href = `/api/runs/${run.id}/export`; else notify('请先创建实验'); };
