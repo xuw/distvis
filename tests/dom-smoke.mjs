@@ -183,7 +183,15 @@ assert.equal(document.querySelector('#link-changed').hidden,false,'the notice su
 await click('#link-use-latest');
 assert.equal(document.querySelector('#link-changed').hidden,true,'use latest resets the baseline');
 assert.notEqual(document.querySelector('#link-latency').value,'556');
+// The redraw stamp carries the whole selection, link direction included.
+const stampNow=()=>vm.runInContext('graphStamp',context);
+await click('#dir-ab');const abStamp=stampNow();
+await click('#dir-ba');const baStamp=stampNow();
+await click('#dir-both');const bothStamp=stampNow();
+assert.equal(new Set([abStamp,baStamp,bothStamp]).size,3,'each link direction is a distinct selection');
+assert.match(bothStamp,/"dir":"both"/);
 vm.runInContext("delete liveState.links['node-2>node-1'];liveRev++;closePopover();",context);
+assert.match(stampNow(),/:null:/,'a closed popover is part of the stamp');
 // A poll that started while this run was active must not revive it after it ended and the user left it.
 const endedRunId=vm.runInContext('run.id',context);
 hold.get=true;const stalePoll=vm.runInContext('refreshRuns()',context);await delay();hold.get=false;

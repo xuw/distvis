@@ -717,10 +717,15 @@ function renderControls() {
   const historyLabel = stop.hidden ? start.dataset.label : '查看运行中的实验';
   if ($('#history-run').textContent !== historyLabel) $('#history-run').textContent = historyLabel;
 }
+// Everything the drawing depends on about the popover selection, including a link's direction.
+function selectionStamp() {
+  if (!popoverOpen || !run) return 'null';
+  return JSON.stringify(linkSel ? { kind: 'link', a: linkSel.a, b: linkSel.b, dir: linkSel.dir } : { kind: 'node', node: selected });
+}
 function render() {
   const state = snapshot();
   $('#empty-graph').hidden = Boolean(run);
-  const stamp = `${run?.id}:${graphView}:${cursor}:${playTime}:${selected}:${popoverOpen ? currentTargetKey() : ''}:${liveRev}:${graphBox.width}x${graphBox.height}:${spaceWindow}:${spaceStart}:${spaceFollow}:${spaceNode}:${hideHeartbeats}`;
+  const stamp = `${run?.id}:${graphView}:${cursor}:${playTime}:${selected}:${selectionStamp()}:${liveRev}:${graphBox.width}x${graphBox.height}:${spaceWindow}:${spaceStart}:${spaceFollow}:${spaceNode}:${hideHeartbeats}`;
   if (stamp !== graphStamp) {
     graphStamp = stamp;
     if (graphView === 'spacetime') drawSpaceTime(state);
