@@ -92,6 +92,8 @@ async function launch(run, source, nodeSources, project) {
   } catch (error) {
     run.status = 'failed';
     run.log('runtime', { level: 'error', phase: 'startup', message: error.message });
+    // Clients watching the stream learn about the failure immediately instead of on the next poll.
+    run.log('lifecycle', { action: 'failed', reason: '实验启动失败' });
     for (const node of run.nodes) {
       run.online[node] = false;
       run.log('node', { node, online: false, reason: '实验启动失败' });

@@ -32,8 +32,18 @@ const statuses = { created: '已创建', starting: '启动中', running: '运行
 const roleLabels = { leader: 'LEADER', follower: 'FOLLOWER', candidate: 'CANDIDATE', critical: 'CRITICAL', waiting: 'WAITING', replica: 'REPLICA', ready: 'READY' };
 let protocolProject=null, protocolProjects=[], runFormMode='run';
 let experiment=null, experiments=[], directoryProjects=[], workspaceView='library', codeDirty=false, codeEdits=0, loadingExperiment=0;
-let protocols = {}, runs = [], run = null, events = [], stream, selected = 'node-1', cursor = 0, playTime = 0, live = true, playing = false, speed = 1, nodeTab = 'node';
+let protocols = {}, runs = [], run = null, events = [], stream, selected = 'node-1', cursor = 0, playTime = 0, live = true, playing = false, speed = 1;
 let cache, cacheCursor = -1, renderDirty = true, latestTime = 0, lastFrame = 0, lastPaint = 0, toastTimer, codeTarget = 'shared', codeDrafts = {}, loadingRun = 0;
+// The popover edits one element at a time: a node, or an unordered link {a, b} with a direction.
+let linkSel = null, popoverOpen = false, popoverOrigin = null, popoverError = null;
+// Controls act on the running experiment, so they read this projection of every received event,
+// never the replay snapshot, which stops at the playback cursor.
+let liveState, liveRev = 0, faultBusy = 0, stopPending = false, refreshSeq = 0, refreshApplied = 0, drawerOpen = false;
+let graphBox = { width: 0, height: 0 };
+const pending = new Set(), linkDrafts = new Map(), inputActions = new Map();
+const terminalStatuses = new Set(['completed', 'failed', 'interrupted']);
+// A run only moves forward through these; an older snapshot never moves it back.
+const statusRank = { created: 0, starting: 1, running: 2, completed: 3, failed: 3, interrupted: 3 };
 let graphView = 'topology', spaceWindow = 1000, graphStamp = '';
 let spaceStart = 0, spaceFollow = true, spaceNode = 'all', hideHeartbeats = false;
 let spaceDrag = null, suppressSpaceClick = false;
@@ -89,33 +99,51 @@ function time(ms, precise = false) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}${precise ? `.${String(Math.floor(ms % 1000)).padStart(3, '0')}` : ''}`;
 }
 function nodes() { return Array.from({ length: run?.config.nodeCount || 0 }, (_, i) => `node-${i + 1}`); }
-function resetCache() { cache = { states: {}, online: Object.fromEntries(nodes().map(n => [n, true])), links: {}, sends: 0, receives: 0, faults: [], sentBy: {}, receivedBy: {} }; cacheCursor = 0; }
-function snapshot() {
-  if (!cache || cursor < cacheCursor) resetCache();
-  for (let i = cacheCursor; i < cursor; i++) {
-    const e = events[i];
-    if (e.type === 'state') cache.states[e.node] = e.state;
-    if (e.type === 'node') cache.online[e.node] = e.online;
-    if (e.type === 'send') { cache.sends++; cache.sentBy[e.from] = (cache.sentBy[e.from] || 0) + 1; }
-    if (e.type === 'receive') { cache.receives++; cache.receivedBy[e.to] = (cache.receivedBy[e.to] || 0) + 1; }
-    if (e.type === 'fault') {
-      const f = e.fault; cache.faults.push(e);
-      if (f.kind === 'heal') cache.links = {};
-      if (f.kind === 'link') {
-        cache.links[`${f.from}>${f.to}`] = f;
-        if (f.bidirectional) cache.links[`${f.to}>${f.from}`] = f;
-      }
+function emptyState() { return { states: {}, online: Object.fromEntries(nodes().map(n => [n, true])), links: {}, sends: 0, receives: 0, faults: [], sentBy: {}, receivedBy: {}, schemas: {}, results: {} }; }
+// One reducer serves both the replay snapshot and the live projection, so they cannot disagree.
+function reduceEvent(acc, e) {
+  if (e.type === 'state') acc.states[e.node] = e.state;
+  else if (e.type === 'node') acc.online[e.node] = e.online;
+  else if (e.type === 'send') { acc.sends++; acc.sentBy[e.from] = (acc.sentBy[e.from] || 0) + 1; }
+  else if (e.type === 'receive') { acc.receives++; acc.receivedBy[e.to] = (acc.receivedBy[e.to] || 0) + 1; }
+  else if (e.type === 'input_schema') acc.schemas[e.node] = e.schema;
+  else if (e.type === 'command_result' || e.type === 'command_error') acc.results[e.node] = e;
+  else if (e.type === 'fault') {
+    const f = e.fault; acc.faults.push(e);
+    if (f.kind === 'heal') acc.links = {};
+    if (f.kind === 'link') {
+      const rule = { latency: f.latency, bandwidth: f.bandwidth, blocked: f.blocked };
+      acc.links[`${f.from}>${f.to}`] = rule;
+      if (f.bidirectional) acc.links[`${f.to}>${f.from}`] = rule;
     }
   }
+  return acc;
+}
+function resetCache() { cache = emptyState(); cacheCursor = 0; }
+function snapshot() {
+  if (!cache || cursor < cacheCursor) resetCache();
+  for (let i = cacheCursor; i < cursor; i++) reduceEvent(cache, events[i]);
   cacheCursor = cursor;
   return cache;
 }
+function hydrateLive() { liveState = emptyState(); for (const e of events) reduceEvent(liveState, e); liveRev++; }
+function markActiveStatus(runId, status) {
+  for (const item of experiments) if (item.latestRun?.id === runId && statusRank[status] >= (statusRank[item.latestRun.status] ?? 0)) item.latestRun.status = status;
+}
+const liveChanges = new Set(['node', 'fault', 'input_schema', 'command_result', 'command_error', 'lifecycle']);
 function receiveEvent(e) {
   if (events.length && e.seq <= events.at(-1).seq) return;
   events.push(e); latestTime = Math.max(latestTime, e.time);
   if (e.type === 'receive' || e.type === 'drop') ends.set(e.id, e);
   if (e.type === 'send') sends.set(e.id, e);
-  if (e.type === 'lifecycle') run.status = e.action === 'start' ? 'running' : 'completed';
+  if (liveState) reduceEvent(liveState, e);
+  if (liveChanges.has(e.type)) liveRev++;
+  if (e.type === 'lifecycle' && run) {
+    const next = { start: 'running', stop: 'completed', failed: 'failed' }[e.action];
+    // A late start must never revive a run that has already ended.
+    if (next && !(terminalStatuses.has(run.status) && next === 'running')) run.status = next;
+    markActiveStatus(run.id, run.status);
+  }
   if (live) { cursor = events.length; playTime = latestTime; }
   renderDirty = true;
 }
@@ -134,7 +162,8 @@ async function openRun(id, asLive = false) {
   selected = 'node-1'; live = asLive; playing = false; latestTime = Math.max(result.time, events.at(-1)?.time || 0);
   cursor = asLive ? events.length : 0; playTime = asLive ? latestTime : 0;
   spaceStart = 0; spaceFollow = true; spaceNode = 'all';
-  resetCache(); populateNodes(); renderDirty = true; graphStamp = '';
+  linkSel = null; popoverOpen = false; popoverError = null;
+  resetCache(); hydrateLive(); populateNodes(); renderDirty = true; graphStamp = '';
   localStorage.setItem(`distvis-run:${experiment.id}`, id);
   stream = new EventSource(`/api/runs/${id}/events?after=${events.at(-1)?.seq || 0}`);
   stream.onmessage = message => { if(run?.id===id)receiveEvent(JSON.parse(message.data)); };
@@ -143,16 +172,9 @@ async function openRun(id, asLive = false) {
   render();
 }
 function populateNodes() {
-  for (const selector of ['#fault-node', '#fault-from', '#fault-to']) $(selector).innerHTML = nodes().map(n => `<option>${n}</option>`).join('');
-  $('#fault-to').selectedIndex = Math.min(1, nodes().length - 1);
   $('#spacetime-node').innerHTML = '<option value="all">全部节点</option>' + nodes().map(n => `<option>${n}</option>`).join('');
 }
-function setTab(tab) {
-  nodeTab = tab;
-  $$('.inspector-tabs button').forEach(b => b.classList.toggle('selected', b.dataset.tab === tab));
-  $('#node-panel').hidden = tab !== 'node'; $('#application-panel').hidden = tab !== 'node'; $('#fault-panel').hidden = tab !== 'fault';
-  renderDirty = true;
-}
+function ruleText(rule) { return !rule ? '默认' : rule.blocked ? '中断' : `${rule.latency} ms · ${rule.bandwidth} KiB/s`; }
 function faultText(f) {
   return { crash: `${f.node} 崩溃`, recover: `${f.node} 恢复`, heal: '恢复全部链路', link: `${f.from} ${f.bidirectional ? '↔' : '→'} ${f.to} · ${f.blocked ? '中断' : `${f.latency}ms / ${f.bandwidth} KiB/s`}` }[f.kind];
 }
@@ -165,22 +187,33 @@ function eventContent(e) {
   if (e.fault) return faultText(e.fault);
   return e.message || e.reason || e.action || (e.type === 'command' ? `${e.key} = ${e.value}` : JSON.stringify(e));
 }
+// Node cards keep a readable minimum size; below it the graph area scrolls instead of shrinking them.
+function graphGeometry(count) {
+  const min = count > 8 ? { width: 640, height: 440 } : count > 6 ? { width: 520, height: 380 } : { width: 380, height: 320 };
+  const width = Math.max(min.width, Math.floor(graphBox.width || 800)), height = Math.max(min.height, Math.floor(graphBox.height || 430));
+  const w = count > 8 ? 76 : 96, h = count > 8 ? 52 : 62, top = 44;
+  return { width, height, w, h, cx: width / 2, cy: (height + top) / 2, rx: width / 2 - w / 2 - 28, ry: (height - top) / 2 - h / 2 - 28 };
+}
 function drawGraph(state) {
   const list = nodes(), count = list.length;
   $('#empty-graph').hidden = Boolean(run);
   if (!run) { $('#graph').innerHTML = ''; return; }
+  const geo = graphGeometry(count), svg = $('#graph');
+  svg.setAttribute('viewBox', `0 0 ${geo.width} ${geo.height}`);
+  svg.style.width = `${geo.width}px`; svg.style.height = `${geo.height}px`;
   const positions = Object.fromEntries(list.map((n, i) => {
     const angle = -Math.PI / 2 + i * 2 * Math.PI / count;
-    return [n, { x: 400 + Math.cos(angle) * 255, y: 218 + Math.sin(angle) * 151 }];
+    return [n, { x: geo.cx + Math.cos(angle) * geo.rx, y: geo.cy + Math.sin(angle) * geo.ry }];
   }));
   const parts = ['<defs><filter id="shadow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#355e53" flood-opacity=".07"/></filter></defs>'];
   for (let i = 0; i < count; i++) for (let j = i + 1; j < count; j++) {
     const from = list[i], to = list[j], a = positions[from], b = positions[to];
     const forward = state.links[`${from}>${to}`], reverse = state.links[`${to}>${from}`];
-    const blocked = forward?.blocked || reverse?.blocked;
-    parts.push(`<path class="link-line ${blocked ? 'blocked' : ''}" d="M${a.x} ${a.y}L${b.x} ${b.y}"/><path class="link-hit" data-from="${from}" data-to="${to}" d="M${a.x} ${a.y}L${b.x} ${b.y}"><title>${from} → ${to}: ${forward?.blocked ? '中断' : `${forward?.latency ?? run.config.latency}ms · ${forward?.bandwidth ?? run.config.bandwidth} KiB/s`}\n${to} → ${from}: ${reverse?.blocked ? '中断' : `${reverse?.latency ?? run.config.latency}ms · ${reverse?.bandwidth ?? run.config.bandwidth} KiB/s`}\n点击配置</title></path>`);
+    const blocked = forward?.blocked || reverse?.blocked, chosen = popoverOpen && linkSel?.a === from && linkSel?.b === to;
+    const summary = `${from} → ${to}：${ruleText(forward)}；${to} → ${from}：${ruleText(reverse)}`;
+    parts.push(`<path class="link-line ${blocked ? 'blocked' : ''} ${chosen ? 'selected' : ''}" d="M${a.x} ${a.y}L${b.x} ${b.y}"/><path class="link-hit" data-from="${from}" data-to="${to}" role="button" tabindex="-1" aria-label="${esc(`${from} 与 ${to} 之间的链路。${summary}`)}" d="M${a.x} ${a.y}L${b.x} ${b.y}"><title>${esc(summary)}\n点击配置链路</title></path>`);
   }
-  parts.push(`<text class="center-label" x="400" y="215" text-anchor="middle">DISTRIBUTED</text><text class="center-protocol" x="400" y="235" text-anchor="middle">${esc({ raft: 'RAFT', token: 'TOKEN RING', gossip: 'LWW STORE', custom: 'YOUR PROTOCOL' }[experiment?.protocol || run.config.protocol] || 'RPC PROTOCOL')}</text>`);
+  parts.push(`<text class="center-label" x="${geo.cx}" y="${geo.cy - 3}" text-anchor="middle">DISTRIBUTED</text><text class="center-protocol" x="${geo.cx}" y="${geo.cy + 17}" text-anchor="middle">${esc({ raft: 'RAFT', token: 'TOKEN RING', gossip: 'LWW STORE', custom: 'YOUR PROTOCOL' }[experiment?.protocol || run.config.protocol] || 'RPC PROTOCOL')}</text>`);
   // The packet's position comes from recorded send/receive times and the playback clock.
   const messages = [];
   for (let i = cursor - 1; i >= 0; i--) {
@@ -212,17 +245,26 @@ function drawGraph(state) {
     parts.push(`<g data-event="${e.seq}" class="packet" tabindex="0" role="button" aria-label="${esc(`${e.from} → ${e.to} · ${messageLabel(e)}`)}"><title>${esc(`${e.from} → ${e.to}\n${eventContent(e)}`)}</title><g transform="translate(${x},${y}) rotate(${angle})"><rect x="-19" y="-15" width="38" height="30" rx="6" fill="transparent"/><path class="packet-arrow" d="M-13 -4H1V-9L14 0 1 9V4H-13Z" fill="${color}" stroke="white" stroke-width="1.5"/></g>${count <= 6 ? `<text class="message-label" x="${x}" y="${y - 18}" text-anchor="middle">${esc(messageLabel(e))}</text>` : ''}</g>`);
   }
   for (const [i, node] of list.entries()) {
-    const p = positions[node], st = state.states[node] || {}, online = state.online[node], active = ['leader', 'critical'].includes(st.role), chosen = selected === node;
+    const p = positions[node], st = state.states[node] || {}, online = state.online[node], active = ['leader', 'critical'].includes(st.role), chosen = selected === node && !linkSel;
     const color = !online ? '#d59195' : active ? '#289780' : st.role === 'candidate' ? '#a18bd2' : '#94a8bc';
     const fill = !online ? '#fdf3f3' : active ? '#f0faf5' : '#ffffff';
-    const w = count > 8 ? 76 : 96, h = count > 8 ? 52 : 62;
-    parts.push(`<g class="graph-node ${!online ? 'node-offline' : ''}" data-node="${node}" tabindex="0" role="button" aria-label="${node}, ${online ? st.role || '启动中' : '离线'}" transform="translate(${p.x},${p.y})"><title>点击查看 ${node} 的详细状态</title>${chosen ? `<rect x="${-w / 2 - 5}" y="${-h / 2 - 5}" width="${w + 10}" height="${h + 10}" rx="16" fill="none" stroke="${color}" opacity=".35" stroke-dasharray="3 3"/>` : ''}<rect class="node-box" x="${-w / 2}" y="${-h / 2}" width="${w}" height="${h}" rx="11" fill="${fill}" stroke="${chosen || active ? color : '#dfe8ec'}" stroke-width="${active ? 1.5 : 1}" filter="url(#shadow)"/><circle cx="${-w / 2 + 13}" cy="${-h / 2 + 13}" r="3" fill="${color}"/><path d="M-7 -13h14v6H-7zm0 9h14v6H-7z" fill="none" stroke="${color}" stroke-width="1.2" transform="translate(0,-3)"/><text class="node-name" x="0" y="15" text-anchor="middle" style="font-size:${count > 8 ? 11 : 13}px">${node}</text><text class="node-role" x="0" y="${h / 2 + 18}" text-anchor="middle">${online ? esc(roleLabels[st.role] || st.role || 'STARTING') : 'OFFLINE'}${run.config.protocol === 'raft' ? ` · T${st.term || 0}` : ''}</text>${active && online ? `<rect x="${w / 2 - 8}" y="${-h / 2 - 7}" width="16" height="16" rx="5" fill="${color}"/><path d="m${w / 2 - 4} ${-h / 2 + 1} 3 3 5-6" stroke="#fff" fill="none" stroke-width="1.5"/>` : ''}</g>`);
+    const { w, h } = geo, actions = (liveState?.schemas[node] || []).length;
+    // Input badges follow the live schema: inputs always go to the running node.
+    const badge = actions ? `<g class="input-badge" data-input-node="${node}" role="button" tabindex="-1" aria-label="${esc(`向 ${node} 发送应用输入`)}"><title>应用输入 · ${actions} 个操作</title><rect x="${-w / 2 - 10}" y="${-h / 2 - 10}" width="${actions > 1 ? 50 : 38}" height="20" rx="10"/><text x="${-w / 2 + (actions > 1 ? 15 : 9)}" y="${-h / 2 + 4}" text-anchor="middle">输入${actions > 1 ? ` ${actions}` : ''}</text></g>` : '';
+    parts.push(`<g class="graph-node ${!online ? 'node-offline' : ''}" data-node="${node}" tabindex="0" role="button" aria-label="${node}, ${online ? st.role || '启动中' : '离线'}${actions ? '，可发送应用输入' : ''}" transform="translate(${p.x},${p.y})"><title>点击打开 ${node} 的操作面板</title>${chosen ? `<rect x="${-w / 2 - 5}" y="${-h / 2 - 5}" width="${w + 10}" height="${h + 10}" rx="16" fill="none" stroke="${color}" opacity=".35" stroke-dasharray="3 3"/>` : ''}<rect class="node-box" x="${-w / 2}" y="${-h / 2}" width="${w}" height="${h}" rx="11" fill="${fill}" stroke="${chosen || active ? color : '#dfe8ec'}" stroke-width="${active ? 1.5 : 1}" filter="url(#shadow)"/><circle cx="${-w / 2 + 13}" cy="${-h / 2 + 13}" r="3" fill="${color}"/><path d="M-7 -13h14v6H-7zm0 9h14v6H-7z" fill="none" stroke="${color}" stroke-width="1.2" transform="translate(0,-3)"/><text class="node-name" x="0" y="15" text-anchor="middle" style="font-size:${count > 8 ? 11 : 13}px">${node}</text><text class="node-role" x="0" y="${h / 2 + 18}" text-anchor="middle">${online ? esc(roleLabels[st.role] || st.role || 'STARTING') : 'OFFLINE'}${run.config.protocol === 'raft' ? ` · T${st.term || 0}` : ''}</text>${active && online ? `<rect x="${w / 2 - 8}" y="${-h / 2 - 7}" width="16" height="16" rx="5" fill="${color}"/><path d="m${w / 2 - 4} ${-h / 2 + 1} 3 3 5-6" stroke="#fff" fill="none" stroke-width="1.5"/>` : ''}${badge}</g>`);
   }
-  replaceGraph($('#graph'), parts.join(''));
+  replaceGraph(svg, parts.join(''));
+}
+function elementSelector(el) {
+  if (el?.dataset.inputNode) return `[data-input-node="${el.dataset.inputNode}"]`;
+  if (el?.dataset.node) return `[data-node="${el.dataset.node}"]`;
+  if (el?.dataset.event) return `[data-event="${el.dataset.event}"]`;
+  if (el?.dataset.from) return `[data-from="${el.dataset.from}"][data-to="${el.dataset.to}"]`;
+  return null;
 }
 function replaceGraph(element, html) {
   const focused = element.contains(document.activeElement) ? document.activeElement : null;
-  const selector = focused?.dataset.node ? `[data-node="${focused.dataset.node}"]` : focused?.dataset.event ? `[data-event="${focused.dataset.event}"]` : null;
+  const selector = elementSelector(focused);
   element.innerHTML = html;
   if (selector) element.querySelector(selector)?.focus();
 }
@@ -347,57 +389,123 @@ function switchView(view) {
   const isSpace = view === 'spacetime';
   // SVGElement.hidden is not reflected to an HTML hidden attribute in real browsers.
   $('#graph').toggleAttribute('hidden', isSpace);
-  $('.graph-hint').hidden = isSpace;
-  $('.graph-legend').hidden = isSpace;
   $('#spacetime-panel').hidden = !isSpace;
+  $('.topology').classList.toggle('spacetime-mode', isSpace);
   $$('.view-switch button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === view)));
   graphStamp = ''; renderDirty = true; render();
 }
 const inputDrafts = new Map();
-function nodeInputSchema() {
-  return events.findLast(e => e.type === 'input_schema' && e.node === selected)?.schema || [];
+function nodeInputSchema(node = selected) { return liveState?.schemas[node] || []; }
+function inputDraftKey(node = selected) { return `${run?.id}:${node}`; }
+function liveOnline(node = selected) { return liveState?.online[node] !== false; }
+function pairKey(a, b) { return `${a}>${b}`; }
+function currentTargetKey() {
+  if (!run) return '';
+  return linkSel ? `${run.id}:link:${pairKey(linkSel.a, linkSel.b)}` : `${run.id}:node:${selected}`;
 }
-function inputDraftKey() { return `${run?.id}:${selected}`; }
-function renderApplicationInput() {
-  const panel = $('#application-panel'), schema = nodeInputSchema();
-  const stamp = `${inputDraftKey()}:${JSON.stringify(schema)}`;
-  if (panel.dataset.stamp !== stamp) {
-    panel.dataset.stamp = stamp;
-    const draft = inputDrafts.get(inputDraftKey()) || {};
-    panel.innerHTML = '<div class="inspector-section-title">应用输入</div>' + (schema.length ? schema.map(s => {
-      const values = draft[s.action] || {};
-      const controls = s.fields.map(f => {
-        const name = esc(f.name), saved = values[f.name] ?? '';
-        const required = f.required ? 'required' : '';
-        let control;
-        if (f.type === 'boolean') control = `<input name="${name}" type="checkbox" ${saved === true ? 'checked' : ''}>`;
-        else if (f.type === 'select') control = `<select name="${name}" ${required}>${!f.required ? '<option value="">使用默认值</option>' : ''}${f.options.map(o => `<option value="${esc(o)}" ${saved === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
-        else if (f.type === 'json') control = `<textarea name="${name}" rows="3" ${required} placeholder='{"value":42}'>${esc(saved)}</textarea>`;
-        else control = `<input name="${name}" type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(saved)}" ${required} ${f.type === 'number' ? `step="${f.integer ? '1' : 'any'}"` : `maxlength="${f.maxLength || 8192}"`} ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}>`;
-        return `<label class="${f.type === 'boolean' ? 'checkbox' : 'field'}">${esc(f.label)}${control}</label>`;
-      }).join('');
-      return `<form class="application-form" data-action="${esc(s.action)}"><h4>${esc(s.label)}</h4>${s.description ? `<p class="form-help">${esc(s.description)}</p>` : ''}${controls}<button type="submit" class="button primary">发送至 ${esc(selected)}</button></form>`;
-    }).join('') : '<p class="form-help">此节点尚未声明应用输入接口。</p>') + '<p id="application-note" class="form-help"></p><div id="application-result"></div>';
+function isCurrent(token) {
+  return token.loadGen === loadingRun && run?.id === token.runId && (token.scope === 'run' || (popoverOpen && currentTargetKey() === token.target));
+}
+// Each request remembers the run, load generation and element it was sent for. A late reply
+// after the user switched runs or elements only clears its own pending flag.
+async function mutate({ key, path, body, fault = false, scope = 'target', success }) {
+  if (!run) throw new Error('请先运行实验');
+  const token = { loadGen: loadingRun, runId: run.id, target: currentTargetKey(), scope };
+  pending.add(key); if (fault) faultBusy++;
+  if (isCurrent(token)) popoverError = null;
+  renderDirty = true; render();
+  try {
+    const result = await api(path, body);
+    success?.(result, isCurrent(token));
+    return result;
+  } catch (error) {
+    if (isCurrent(token)) {
+      if (scope === 'target') popoverError = { target: token.target, message: error.message };
+      notify(error.message);
+    }
+  } finally {
+    pending.delete(key); if (fault) faultBusy = Math.max(0, faultBusy - 1);
+    renderDirty = true;
   }
-  const latestOnline = events.findLast(e => e.type === 'node' && e.node === selected)?.online !== false;
-  const enabled = run.status === 'running' && latestOnline;
-  panel.querySelectorAll('button[type="submit"]').forEach(b => { b.disabled = !enabled; });
-  $('#application-note').textContent = enabled ? (live ? '输入发送至实时节点，并记录在事件流和时空图中。' : '当前正在回放；输入仍发送至正在运行的实时节点。') : '实验未运行或节点已离线，无法发送输入。';
-  const result = events.slice(0,cursor).findLast(e=>e.node===selected && e.type==='command_result');
-  $('#application-result').innerHTML = result ? `<div class="inspector-section-title">最近 RPC 返回 <span>${esc(result.commandId)}</span></div>${result.error ? `<p class="form-help">${esc(result.error)}</p>` : fieldRows(result.result)}` : '';
+}
+// A draft value survives a schema change only if its field keeps the same name and type.
+function draftValue(field, entry) {
+  const saved = entry?.type === field.type ? entry.value : undefined;
+  if (saved === undefined) return field.type === 'boolean' ? false : '';
+  if (field.type === 'select' && saved !== '' && !field.options.includes(saved)) return '';
+  return saved;
+}
+function applicationForm(s, values, chosen) {
+  const controls = s.fields.map(f => {
+    const name = esc(f.name), saved = draftValue(f, values[f.name]);
+    const required = f.required ? 'required' : '';
+    let control;
+    if (f.type === 'boolean') control = `<input name="${name}" type="checkbox" ${saved === true ? 'checked' : ''}>`;
+    else if (f.type === 'select') control = `<select name="${name}" ${required}>${!f.required ? '<option value="">使用默认值</option>' : ''}${f.options.map(o => `<option value="${esc(o)}" ${saved === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+    else if (f.type === 'json') control = `<textarea name="${name}" rows="3" ${required} placeholder='{"value":42}'>${esc(saved)}</textarea>`;
+    else control = `<input name="${name}" type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(saved)}" ${required} ${f.type === 'number' ? `step="${f.integer ? '1' : 'any'}"` : `maxlength="${f.maxLength || 8192}"`} ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}>`;
+    return `<label class="${f.type === 'boolean' ? 'checkbox' : 'field'}">${esc(f.label)}${control}</label>`;
+  }).join('');
+  return `<form class="application-form" data-action="${esc(s.action)}" ${s.action === chosen ? '' : 'hidden'}><h4>${esc(s.label)}</h4>${s.description ? `<p class="form-help">${esc(s.description)}</p>` : ''}${controls}<button type="submit" class="button primary">发送至 ${esc(selected)}</button></form>`;
+}
+function renderApplicationInput() {
+  const panel = $('#application-panel'), node = selected, schema = nodeInputSchema(node), key = inputDraftKey(node);
+  let chosen = inputActions.get(key);
+  if (!schema.some(s => s.action === chosen)) chosen = schema[0]?.action;
+  // Forms are rebuilt only when the node or its declared schema changes, so typing survives live updates.
+  const stamp = `${key}:${JSON.stringify(schema)}`;
+  // An IME composition in progress would be destroyed by a rebuild; wait until it ends.
+  if (panel.dataset.stamp !== stamp && !composingInput) {
+    const active = panel.contains(document.activeElement) ? document.activeElement : null;
+    const focus = active && { action: active.closest('form')?.dataset.action, name: active.name, id: active.id, start: active.selectionStart, end: active.selectionEnd };
+    panel.dataset.stamp = stamp;
+    const draft = inputDrafts.get(key) || {};
+    const chooser = schema.length > 1 ? `<label class="field action-choice">操作<select id="input-action" aria-label="选择应用输入操作">${schema.map(s => `<option value="${esc(s.action)}">${esc(s.label)}</option>`).join('')}</select></label>` : '';
+    panel.innerHTML = '<div class="inspector-section-title">应用输入 <span class="live-tag">实时</span></div>' + (schema.length ? chooser + schema.map(s => applicationForm(s, draft[s.action] || {}, chosen)).join('') : '<p class="form-help">此节点尚未声明应用输入接口。</p>') + '<p id="application-note" class="form-help"></p><div id="application-result"></div>';
+    if (focus?.id === 'input-action') $('#input-action')?.focus();
+    else if (focus?.name) {
+      const form = [...panel.querySelectorAll('form')].find(f => f.dataset.action === focus.action);
+      const field = form && [...form.querySelectorAll('[name]')].find(el => el.name === focus.name);
+      field?.focus();
+      try { if (focus.start != null) field?.setSelectionRange(focus.start, focus.end); } catch {}
+    }
+  }
+  if ($('#input-action') && $('#input-action').value !== chosen) $('#input-action').value = chosen;
+  const reason = run.status !== 'running' ? '实验未运行，无法发送输入。' : !liveOnline(node) ? `${node} 当前离线，无法发送输入。` : '';
+  for (const form of panel.querySelectorAll('form.application-form')) {
+    form.hidden = form.dataset.action !== chosen;
+    form.querySelector('button[type="submit"]').disabled = !!reason || pending.has(`${run.id}:node:${node}:input:${form.dataset.action}`);
+  }
+  $('#application-note').textContent = reason || (live ? '输入发送至实时节点，并记录在事件流和时空图中。' : '当前为回放；输入仍发送至正在运行的实时节点。');
+  $('#application-note').classList.toggle('warning', !!reason);
+  // The latest reply comes from live events, even when the playback cursor is earlier.
+  const result = liveState.results[node], resultPanel = $('#application-result');
+  if (resultPanel.dataset.seq !== String(result?.seq ?? '')) {
+    resultPanel.dataset.seq = String(result?.seq ?? '');
+    const failure = result?.error || result?.message;
+    resultPanel.innerHTML = result ? `<div class="inspector-section-title">${result.type === 'command_error' ? '最近输入失败' : '最近 RPC 返回'} <span>${esc(result.commandId || `#${result.commandSeq}`)}</span></div>${failure ? `<p class="form-help warning">${esc(failure)}</p>` : fieldRows(result.result)}` : '';
+  }
 }
 $('#application-panel').addEventListener('input', e => {
   const form = e.target.closest('form');
-  if (!form) return;
+  if (!form || !e.target.name) return;
   const key = inputDraftKey(), draft = inputDrafts.get(key) || {};
+  const type = nodeInputSchema().find(s => s.action === form.dataset.action)?.fields.find(f => f.name === e.target.name)?.type;
   draft[form.dataset.action] ||= {};
-  draft[form.dataset.action][e.target.name] = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+  draft[form.dataset.action][e.target.name] = { value: e.target.type === 'checkbox' ? e.target.checked : e.target.value, type };
   inputDrafts.set(key, draft);
+});
+let composingInput = false;
+$('#application-panel').addEventListener('compositionstart', () => { composingInput = true; });
+$('#application-panel').addEventListener('compositionend', () => { composingInput = false; renderDirty = true; });
+$('#application-panel').addEventListener('change', e => {
+  if (e.target.id !== 'input-action') return;
+  inputActions.set(inputDraftKey(), e.target.value); renderDirty = true; render();
 });
 $('#application-panel').addEventListener('submit', guard(async e => {
   e.preventDefault();
-  const form = e.target, action = form.dataset.action;
-  const schema = nodeInputSchema().find(s => s.action === action), values = {};
+  const form = e.target, action = form.dataset.action, node = selected;
+  const schema = nodeInputSchema(node).find(s => s.action === action), values = {};
   if (!schema) throw new Error('输入声明已变更，请重新填写');
   for (const f of schema.fields) {
     const el = form.elements.namedItem(f.name);
@@ -408,27 +516,144 @@ $('#application-panel').addEventListener('submit', guard(async e => {
       } else values[f.name] = f.type === 'number' ? Number(el.value) : el.value;
     }
   }
-  const result = await api(`/api/runs/${run.id}/commands`, { node: selected, action, values });
-  notify(`应用输入已发送 · #${result.commandSeq}`);
+  await mutate({ key: `${run.id}:node:${node}:input:${action}`, path: `/api/runs/${run.id}/commands`, body: { node, action, values },
+    success: (result, current) => { if (current) notify(`应用输入已发送 · #${result.commandSeq}`); } });
 }));
-function renderInspector(state) {
-  if (!run) return;
+function faultBlockReason() {
+  return run.status !== 'running' ? '实验未运行，无法注入故障。' : faultBusy ? '上一项故障操作正在执行…' : '';
+}
+function renderNodePopover(state) {
+  const node = selected, online = liveOnline(node);
+  $('#popover-title').textContent = node;
+  $('#popover-status').textContent = online ? '在线' : '离线';
+  $('#popover-status').className = `badge ${online ? '' : 'failed'}`;
+  $('#popover-status').title = '实时状态';
   renderApplicationInput();
-  const st = state.states[selected] || {}, online = state.online[selected];
-  if (nodeTab === 'node') {
-    const stamp = JSON.stringify([run.id, selected, st, online, state.sentBy[selected], state.receivedBy[selected], run.status, live, Math.floor(playTime / 1000)]);
-    if ($('#node-panel').dataset.stamp !== stamp) {
-      // Preserve a student's in-progress client write while state updates arrive.
-      const focused = $('#node-panel').contains(document.activeElement);
-      if (focused && document.activeElement.matches('input')) return;
-      const rawOpen=$('#node-panel').dataset.node===selected && $('#node-panel .state-raw')?.open;
-      $('#node-panel').dataset.node=selected;
-      $('#node-panel').dataset.stamp = stamp;
-      $('#node-panel').innerHTML = `<div class="node-summary"><div class="node-avatar">${esc(selected.split('-')[1])}</div><div><h3>${esc(selected)}</h3><p>${run.config.runtime === 'simulation' ? '教学仿真节点' : 'Go · 独立容器进程'}</p></div><span class="badge ${online ? '' : 'failed'}">${online ? '在线' : '离线'}</span></div><div class="detail-row"><span>发送 / 接收消息</span><strong>${state.sentBy[selected] || 0} / ${state.receivedBy[selected] || 0}</strong></div><div class="detail-row"><span>视图位置</span><strong>${live ? '实时' : '历史回放'} · ${time(playTime)}</strong></div><div class="inspector-section-title">主要状态</div><div class="node-key-state">${fieldRows(st)}</div><details class="state-raw" ${rawOpen?'open':''}><summary>完整状态 JSON</summary><pre class="json-state">${esc(JSON.stringify(st, null, 2))}</pre></details><div class="node-actions"><button class="button" data-node-action="crash" ${run.status !== 'running' ? 'disabled' : ''}>模拟崩溃</button><button class="button" data-node-action="recover" ${run.status !== 'running' ? 'disabled' : ''}>恢复节点</button></div>`;
-    }
+  const toggle = $('#node-toggle'), reason = faultBlockReason(), label = online ? '模拟崩溃' : '恢复节点';
+  toggle.dataset.nodeAction = online ? 'crash' : 'recover';
+  if (toggle.dataset.label !== label) { toggle.dataset.label = label; toggle.innerHTML = icon('bolt') + label; }
+  toggle.disabled = !!reason || pending.has(`${run.id}:node:${node}:toggle`);
+  $('#node-toggle-note').textContent = reason || (live ? '作用于实时实验。' : '当前为回放；此操作作用于实时实验。');
+  const peers = nodes().filter(p => p !== node).map(p => [p, liveState.links[pairKey(node, p)], liveState.links[pairKey(p, node)]]);
+  const list = $('#peer-links'), peerStamp = JSON.stringify([run.id, node, peers]);
+  if (list.dataset.stamp !== peerStamp) {
+    const focusedPeer = list.contains(document.activeElement) ? document.activeElement.dataset.peer : null;
+    list.dataset.stamp = peerStamp;
+    list.innerHTML = peers.map(([p, out, back]) => `<button class="peer-link ${out?.blocked || back?.blocked ? 'blocked' : ''}" data-peer="${p}" aria-label="${esc(`配置 ${node} 与 ${p} 之间的链路：发出 ${ruleText(out)}，收到 ${ruleText(back)}`)}"><strong>${p}</strong><span>→ ${ruleText(out)}</span><span>← ${ruleText(back)}</span></button>`).join('');
+    if (focusedPeer) list.querySelector(`[data-peer="${focusedPeer}"]`)?.focus();
   }
-  $('#fault-history').innerHTML = state.faults.slice(-4).reverse().map(e => `<div class="fault-item"><span>${esc(faultText(e.fault))}</span><span>${time(e.time)}</span></div>`).join('') || '暂无故障';
-  $('#inject-fault').disabled = run.status !== 'running';
+  // State rows follow the playback cursor and say so, unlike the live controls above them.
+  const st = state.states[node] || {}, replayOnline = state.online[node], panel = $('#node-panel');
+  const stamp = JSON.stringify([run.id, node, st, replayOnline, state.sentBy[node], state.receivedBy[node], live, live ? 0 : Math.floor(playTime / 1000)]);
+  if (panel.dataset.stamp !== stamp) {
+    const rawOpen = panel.dataset.node === node && panel.querySelector('.state-raw')?.open, hadFocus = panel.contains(document.activeElement);
+    panel.dataset.node = node; panel.dataset.stamp = stamp;
+    panel.innerHTML = `<div class="inspector-section-title">${live ? '当前状态' : `回放 @ ${time(playTime)}`}<span>${!live && replayOnline === false ? '回放时刻离线 · ' : ''}发送 ${state.sentBy[node] || 0} / 接收 ${state.receivedBy[node] || 0}</span></div><div class="node-key-state">${fieldRows(st)}</div><details class="state-raw" ${rawOpen ? 'open' : ''}><summary>完整状态 JSON</summary><pre class="json-state">${esc(JSON.stringify(st, null, 2))}</pre></details>`;
+    if (hadFocus) panel.querySelector('.state-raw summary')?.focus();
+  }
+}
+function linkRule(from, to) { return liveState.links[pairKey(from, to)]; }
+function linkEnds() { return linkSel.dir === 'ba' ? [linkSel.b, linkSel.a] : [linkSel.a, linkSel.b]; }
+function linkDraftKey() { return `${run.id}:${pairKey(linkSel.a, linkSel.b)}:${linkSel.dir}`; }
+function linkBase() { return JSON.stringify(linkRule(...linkEnds()) || null); }
+function fillLinkForm(values) { $('#link-latency').value = values.latency; $('#link-bandwidth').value = values.bandwidth; $('#link-blocked').checked = values.blocked; }
+function liveLinkValues() {
+  const rule = linkRule(...linkEnds());
+  return { latency: String(rule?.latency ?? run.config.latency), bandwidth: String(rule?.bandwidth ?? run.config.bandwidth), blocked: !!rule?.blocked };
+}
+function renderLinkPopover() {
+  const { a, b, dir } = linkSel, ab = linkRule(a, b), ba = linkRule(b, a);
+  $('#popover-title').textContent = `${a} ↔ ${b}`;
+  $('#popover-status').textContent = '链路'; $('#popover-status').className = 'badge neutral'; $('#popover-status').title = '';
+  const rules = JSON.stringify([a, b, ab, ba]);
+  if ($('#link-rules').dataset.stamp !== rules) {
+    $('#link-rules').dataset.stamp = rules;
+    $('#link-rules').innerHTML = `<div class="detail-row" data-direction="ab"><span>${a} → ${b}</span><strong>${ruleText(ab)}</strong></div><div class="detail-row" data-direction="ba"><span>${b} → ${a}</span><strong>${ruleText(ba)}</strong></div>`;
+  }
+  $('#dir-ab').textContent = `${a} → ${b}`; $('#dir-ba').textContent = `${b} → ${a}`;
+  $$('.direction-choice button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.dir === dir)));
+  // A dirty draft is never overwritten by live updates; the user decides whether to take the new rule.
+  const key = linkDraftKey(), base = linkBase(), draft = linkDrafts.get(key), form = $('#link-form');
+  if (draft) { if (form.dataset.key !== key) fillLinkForm(draft); }
+  else if (form.dataset.key !== key || form.dataset.base !== base) fillLinkForm(liveLinkValues());
+  form.dataset.key = key; form.dataset.base = base;
+  $('#link-changed').hidden = !draft || draft.base === base;
+  $('#link-notice').hidden = dir !== 'both';
+  $('#link-notice').textContent = JSON.stringify(ab || null) !== JSON.stringify(ba || null) ? '两个方向当前的规则不同；应用后两个方向都会被覆盖为下面的相同设置。' : '将同时应用到两个方向。';
+  const reason = faultBlockReason();
+  $('#apply-link').disabled = !!reason || pending.has(`${run.id}:link:${pairKey(a, b)}`);
+  $('#link-note').textContent = reason || (live ? '作用于实时实验。' : '当前为回放；此设置作用于实时实验。');
+}
+function renderPopover(state) {
+  const pop = $('#element-popover');
+  pop.hidden = !popoverOpen || !run;
+  if (pop.hidden) return;
+  $('#popover-node').hidden = !!linkSel; $('#popover-link').hidden = !linkSel; $('#popover-back').hidden = !linkSel;
+  const error = popoverError?.target === currentTargetKey() ? popoverError.message : '';
+  $('#popover-error').hidden = !error; $('#popover-error').textContent = error;
+  if (linkSel) renderLinkPopover(); else renderNodePopover(state);
+}
+function sheetMode() { return typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches; }
+function popoverAnchor() {
+  if (linkSel?.origin.kind === 'graph' && graphView !== 'spacetime') return $(`#graph [data-from="${linkSel.a}"][data-to="${linkSel.b}"]`);
+  return $(`${graphView === 'spacetime' ? '#spacetime' : '#graph'} [data-node="${linkSel ? linkSel.origin.node : selected}"]`);
+}
+// The popover lives outside the SVGs (they are rebuilt every frame) and is re-anchored after each
+// paint: beside the element when there is room, otherwise above or below it, inside the graph area.
+function anchorPopover() {
+  const pop = $('#element-popover');
+  if (pop.hidden) return;
+  if (sheetMode()) { pop.style.left = ''; pop.style.top = ''; pop.style.maxHeight = ''; pop.style.width = ''; return; }
+  // Stay inside the drawing itself so the view toolbar and space-time filters remain usable.
+  const space = graphView === 'spacetime', anchor = popoverAnchor(), host = $('.lab-grid'), area = $(space ? '.spacetime-scroll' : '.graph-area');
+  if (typeof anchor?.getBoundingClientRect !== 'function' || !Number.isFinite(pop.offsetWidth)) return;
+  const hostBox = host.getBoundingClientRect(), areaBox = area.getBoundingClientRect(), toolbar = space ? 0 : $('.graph-toolbar').getBoundingClientRect().bottom - areaBox.top;
+  const box = { left: areaBox.left, right: areaBox.right, top: areaBox.top + Math.max(0, toolbar), bottom: areaBox.bottom, height: areaBox.height - Math.max(0, toolbar) };
+  let r = anchor.getBoundingClientRect();
+  if (anchor.dataset.from) { const x = r.left + r.width / 2, y = r.top + r.height / 2; r = { left: x - 8, right: x + 8, top: y - 8, bottom: y + 8, width: 16, height: 16 }; }
+  const gap = 12, edge = 8, fullHeight = Math.max(220, Math.min(560, Math.floor(box.height - 16)));
+  pop.style.width = ''; pop.style.maxHeight = `${fullHeight}px`;
+  let w = pop.offsetWidth, h = pop.offsetHeight, left, top;
+  const right = box.right - edge - (r.right + gap), leftSpace = r.left - gap - (box.left + edge);
+  const below = box.bottom - edge - (r.bottom + gap), above = r.top - gap - (box.top + edge);
+  // Prefer a side; then a narrower side; then above/below with a shorter panel. The anchor stays visible.
+  if (right >= w || leftSpace >= w || Math.max(right, leftSpace) >= 240) {
+    const useRight = right >= w || (leftSpace < w && right >= leftSpace);
+    if (Math.max(right, leftSpace) < w) { w = Math.floor(Math.max(right, leftSpace)); pop.style.width = `${w}px`; h = pop.offsetHeight; }
+    left = useRight ? r.right + gap : r.left - gap - w;
+    top = Math.min(Math.max(r.top + r.height / 2 - h / 2, box.top + edge), Math.max(box.top + edge, box.bottom - edge - h));
+  } else {
+    const useBelow = below >= above, room = Math.max(160, Math.floor(useBelow ? below : above));
+    pop.style.maxHeight = `${Math.min(fullHeight, room)}px`; h = pop.offsetHeight;
+    left = Math.min(Math.max(box.left + edge, r.left + r.width / 2 - w / 2), box.right - edge - w);
+    top = useBelow ? r.bottom + gap : r.top - gap - h;
+  }
+  pop.style.left = `${Math.round(left - hostBox.left)}px`; pop.style.top = `${Math.round(top - hostBox.top)}px`;
+}
+function nodeIndex(node) { return Number(node.split('-')[1]); }
+function openNodePopover(node, origin, focusInput = false) {
+  selected = node; linkSel = null; popoverOpen = true; popoverError = null;
+  if (origin) popoverOrigin = origin;
+  graphStamp = ''; renderDirty = true; render();
+  const form = [...$('#application-panel').querySelectorAll('form')].find(f => !f.hidden);
+  const field = focusInput && form?.querySelector('input, select, textarea');
+  (field || $('#popover-title')).focus?.();
+}
+function openLinkPopover(from, to, origin) {
+  const [a, b] = nodeIndex(from) < nodeIndex(to) ? [from, to] : [to, from];
+  linkSel = { a, b, dir: from === a ? 'ab' : 'ba', origin: { kind: origin, node: origin === 'graph' ? a : selected } };
+  popoverOpen = true; popoverError = null;
+  graphStamp = ''; renderDirty = true; render();
+  $('#popover-title').focus?.();
+}
+function closePopover() {
+  if (!popoverOpen) return;
+  popoverOpen = false; linkSel = null; popoverError = null;
+  graphStamp = ''; renderDirty = true; render();
+  // Return focus to where the popover was opened; a redraw may have replaced that element.
+  const view = graphView === 'spacetime' ? '#spacetime' : '#graph';
+  const origin = (popoverOrigin && $(`${view} ${popoverOrigin}`)) || $(`${view} [data-node="${selected}"]`);
+  (origin || $('.graph-area')).focus?.();
 }
 function renderEvents() {
   const filter = $('#event-filter').value, query = $('#event-search').value.toLowerCase();
@@ -436,23 +661,52 @@ function renderEvents() {
   $('#event-rows').innerHTML = subset.map(e => `<tr data-event="${e.seq}" class="${e.seq === cursor ? 'current-event' : ''}"><td><span class="event-time">#${String(e.seq).padStart(3, '0')}</span>${time(e.time, true)}</td><td><span class="event-tag ${e.type}">${labels[e.type] || esc(e.type)}</span></td><td>${esc(e.from ? `${e.from} → ${e.to}` : e.node || 'coordinator')}</td><td title="${esc(eventContent(e))}">${esc(eventContent(e))}</td></tr>`).join('') || '<tr><td colspan="4" class="empty-table">当前位置没有匹配的事件。</td></tr>';
   $('#event-count').textContent = cursor.toLocaleString();
 }
+// The run shown on screen and the globally active run can differ (history replay, another
+// experiment running). The primary button never targets a run the user is not looking at.
+function runControlState() {
+  const active = experiments.find(e => ['starting', 'running'].includes(e.latestRun?.status));
+  if (run && ['starting', 'running'].includes(run.status)) return { mode: run.status === 'starting' ? 'starting' : 'stop' };
+  if (active) return { mode: 'goto', experimentId: active.id, name: active.name };
+  if (!run) return { mode: 'run' };
+  return { mode: run.status === 'failed' ? 'failed' : 'rerun' };
+}
+function renderControls() {
+  const state = runControlState(), start = $('#new-run'), stop = $('#stop-run');
+  stop.hidden = !['stop', 'starting'].includes(state.mode); start.hidden = !stop.hidden;
+  if (!stop.hidden) {
+    const label = state.mode === 'starting' ? '启动中…' : stopPending ? '正在结束…' : '结束实验';
+    if (stop.dataset.label !== label) { stop.dataset.label = label; stop.innerHTML = icon('stop') + label; }
+    stop.disabled = state.mode === 'starting' || stopPending;
+    stop.title = state.mode === 'starting' ? '节点构建完成后才能结束实验' : '';
+  } else {
+    const label = { run: '运行实验', rerun: '重新运行', failed: '重新运行', goto: '前往运行中的实验' }[state.mode];
+    if (start.dataset.label !== label) { start.dataset.label = label; start.innerHTML = icon(state.mode === 'goto' ? 'network' : 'play') + label; }
+    start.dataset.mode = state.mode;
+    start.title = state.mode === 'goto' ? `「${state.name}」正在运行` : '';
+  }
+  $('#view-error').hidden = state.mode !== 'failed';
+  // The run history offers the same entry point; while a run is active it leads back to it.
+  const historyLabel = stop.hidden ? start.dataset.label : '查看运行中的实验';
+  if ($('#history-run').textContent !== historyLabel) $('#history-run').textContent = historyLabel;
+}
 function render() {
   const state = snapshot();
   $('#empty-graph').hidden = Boolean(run);
-  const stamp = `${run?.id}:${graphView}:${cursor}:${playTime}:${selected}:${spaceWindow}:${spaceStart}:${spaceFollow}:${spaceNode}:${hideHeartbeats}`;
+  const stamp = `${run?.id}:${graphView}:${cursor}:${playTime}:${selected}:${popoverOpen ? currentTargetKey() : ''}:${liveRev}:${graphBox.width}x${graphBox.height}:${spaceWindow}:${spaceStart}:${spaceFollow}:${spaceNode}:${hideHeartbeats}`;
   if (stamp !== graphStamp) {
     graphStamp = stamp;
     if (graphView === 'spacetime') drawSpaceTime(state);
     else drawGraph(state);
   }
-  if (!renderDirty) return;
-  renderDirty = false;
+  if (renderDirty) { renderDirty = false; renderPanels(state); }
+  anchorPopover();
+}
+function renderPanels(state) {
   if (run) {
     $('#experiment-name').textContent = run.config.name;
-    $('#experiment-meta').textContent = `${run.config.nodeCount} 个节点   ·   ${ { simulation: '内置参考模型', docker: 'Docker / 真实 Go', kubernetes: 'K8s / 真实 Go' }[run.config.runtime]}   ·   ${run.config.latency} ms 延迟${run.config.runtime==='simulation'?`   ·   Seed ${run.config.seed}`:''}`;
+    $('#experiment-meta').textContent = `${run.config.nodeCount} 个节点 · ${ { simulation: '内置参考模型', docker: 'Docker / 真实 Go', kubernetes: 'K8s / 真实 Go' }[run.config.runtime]} · ${run.config.latency} ms 延迟${run.config.runtime==='simulation'?` · Seed ${run.config.seed}`:''}`;
     $('#run-status').textContent = statuses[run.status];
     $('#run-status').className = `badge ${run.status === 'running' ? '' : run.status === 'failed' ? 'failed' : 'neutral'}`;
-    $('#stop-run').disabled = run.status !== 'running';
     $('#mode-label').textContent = live ? '● 实时观察' : playing ? `▶ ${speed}× 回放` : 'Ⅱ 回放已暂停';
     // Startup diagnostics are run-level information, also visible at replay position 0.
     $('#run-error').hidden = run.status !== 'failed';
@@ -464,18 +718,22 @@ function render() {
       $('#run-error-log').textContent = message;
     }
   }
-  if(!run){$('#experiment-name').textContent='尚未运行';$('#experiment-meta').textContent='使用所属协议的代码和本实验参数开始运行';$('#run-status').textContent='就绪';$('#run-status').className='badge neutral';$('#stop-run').disabled=true;$('#run-error').hidden=true;$('#mode-label').textContent='准备就绪';}
+  if(!run){$('#experiment-name').textContent='尚未运行';$('#experiment-meta').textContent='使用所属协议的代码和本实验参数开始运行';$('#run-status').textContent='就绪';$('#run-status').className='badge neutral';$('#run-error').hidden=true;$('#mode-label').textContent='准备就绪';}
+  renderControls();
   $('#view-run-source').disabled=!run;$('#export-run').disabled=!run;
   $('#metric-nodes').innerHTML = run ? `${Object.values(state.online).filter(Boolean).length}<span>/ ${run.config.nodeCount}</span>` : '—';
   $('#metric-messages').textContent = state.sends.toLocaleString();
-  $('#metric-time').innerHTML = `${(playTime / 1000).toFixed(2)}<span>s</span>`;
   $('#metric-faults').textContent = state.faults.length;
   $('#timecode').textContent = time(playTime, true);
   $('#timeline').max = Math.max(1, events.length); $('#timeline').value = cursor;
   $('#timeline-end').textContent = time(latestTime);
   $('#fault-markers').innerHTML = events.filter(e => e.type === 'fault').map(e => `<i style="left:${e.seq / Math.max(1, events.length) * 100}%" title="${esc(faultText(e.fault))}"></i>`).join('');
   $('#play').innerHTML = icon(live || playing ? 'pause' : 'play');
-  renderInspector(state); renderEvents();
+  // Heal and the fault history act on and describe the live run, whatever the popover shows.
+  $('#heal-links').disabled = !run || !!faultBlockReason() || pending.has(`${run.id}:heal`);
+  $('#fault-history').innerHTML = run ? liveState.faults.slice(-6).reverse().map(e => `<div class="fault-item"><span>${esc(faultText(e.fault))}</span><span>${time(e.time)}</span></div>`).join('') || '暂无故障' : '暂无故障';
+  if (run) renderPopover(state); else $('#element-popover').hidden = true;
+  renderEvents();
 }
 function seek(count) {
   live = false; playing = false; cursor = Math.max(0, Math.min(events.length, Number(count)));
@@ -508,17 +766,19 @@ function eventDetail(seq, { locate = true } = {}) {
   $('#event-dialog').showModal();
 }
 function graphClick(e) {
-  const node = e.target.closest('[data-node]'), link = e.target.closest('[data-from]'), event = e.target.closest('[data-event]');
-  if (node) { selected = node.dataset.node; setTab('node'); renderDirty = true; render(); }
+  const badge = e.target.closest('[data-input-node]'), node = e.target.closest('[data-node]'), link = e.target.closest('[data-from]'), event = e.target.closest('[data-event]');
+  if (badge) openNodePopover(badge.dataset.inputNode, `[data-node="${badge.dataset.inputNode}"]`, true);
+  else if (node) openNodePopover(node.dataset.node, `[data-node="${node.dataset.node}"]`);
   else if (event) eventDetail(event.dataset.event, { locate: false });
-  else if (link) { setTab('fault'); $('#fault-kind').value = 'link'; updateFaultFields(); $('#fault-from').value = link.dataset.from; $('#fault-to').value = link.dataset.to; }
+  else if (link) { popoverOrigin = `[data-from="${link.dataset.from}"][data-to="${link.dataset.to}"]`; openLinkPopover(link.dataset.from, link.dataset.to, 'graph'); }
+  else if (popoverOpen) closePopover();
 }
 for (const svg of [$('#graph'), $('#spacetime')]) {
   svg.addEventListener('click', graphClick);
   svg.addEventListener('keydown', e => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
-      e.target.closest('[data-node], [data-event]')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      e.target.closest('[data-input-node], [data-node], [data-event], [data-from]')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     }
   });
 }
@@ -579,27 +839,61 @@ if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(() => {
     if (graphView === 'spacetime') { graphStamp = ''; render(); }
   }).observe(spaceCanvas);
+  // Topology geometry follows its container; the callback is coalesced into one frame and the
+  // SVG's size never feeds back into the observed box (the area scrolls instead).
+  let resizeFrame=0;
+  new ResizeObserver(entries => {
+    const box=entries[0].contentRect, next={ width: Math.floor(box.width), height: Math.floor(box.height) };
+    if (next.width === graphBox.width && next.height === graphBox.height) return;
+    cancelAnimationFrame(resizeFrame);
+    resizeFrame=requestAnimationFrame(() => { graphBox=next; graphStamp=''; renderDirty=true; render(); });
+  }).observe($('.graph-area'));
 }
 $('#event-rows').onclick = e => { const row = e.target.closest('[data-event]'); if (row) eventDetail(row.dataset.event); };
-$('.inspector-tabs').onclick = e => { if (e.target.dataset.tab) { setTab(e.target.dataset.tab); render(); } };
-$('#node-panel').addEventListener('click', guard(async e => {
-  const action = e.target.closest('[data-node-action]')?.dataset.nodeAction;
-  if (action) { await api(`/api/runs/${run.id}/faults`, { kind: action, node: selected }); notify('操作已记录到实时实验'); }
-}));
-function updateFaultFields() {
-  const kind = $('#fault-kind').value;
-  $('#node-fault-fields').hidden = !['crash', 'recover'].includes(kind);
-  $('#link-fault-fields').hidden = kind !== 'link';
-  $('#inject-fault').innerHTML = icon('bolt') + ({ recover: '恢复节点', heal: '恢复全部链路', link: '应用链路设置' }[kind] || '注入节点故障');
-}
-$('#fault-kind').onchange = updateFaultFields;
-$('#inject-fault').onclick = guard(async () => {
-  if (!run) throw new Error('请先创建实验');
-  const kind = $('#fault-kind').value;
-  const fault = { kind, node: $('#fault-node').value };
-  if (kind === 'link') Object.assign(fault, { from: $('#fault-from').value, to: $('#fault-to').value, latency: Number($('#fault-latency').value), bandwidth: Number($('#fault-bandwidth').value), blocked: $('#fault-blocked').checked, bidirectional: $('#fault-both').checked });
-  await api(`/api/runs/${run.id}/faults`, fault); notify('故障设置已应用并归档');
+$('#popover-close').onclick = closePopover;
+$('#popover-back').onclick = () => { if (linkSel) openNodePopover(linkSel.origin.node, `[data-node="${linkSel.origin.node}"]`); };
+$('#node-toggle').onclick = guard(async () => {
+  if (!run || linkSel) return;
+  const node = selected, action = $('#node-toggle').dataset.nodeAction;
+  await mutate({ key: `${run.id}:node:${node}:toggle`, fault: true, path: `/api/runs/${run.id}/faults`, body: { kind: action, node },
+    success: (result, current) => { if (current) notify(action === 'crash' ? `${node} 已崩溃 · 实时实验` : `${node} 已恢复 · 实时实验`); } });
 });
+$('#peer-links').onclick = e => { const peer = e.target.closest('[data-peer]'); if (peer) openLinkPopover(selected, peer.dataset.peer, 'node'); };
+$('.direction-choice').onclick = e => {
+  const button = e.target.closest('[data-dir]');
+  if (button && linkSel) { linkSel.dir = button.dataset.dir; renderDirty = true; render(); }
+};
+function saveLinkDraft() {
+  if (!linkSel || !run) return;
+  // The baseline is the live rule when editing began, so a later live change is still reported.
+  const key = linkDraftKey(), base = linkDrafts.get(key)?.base ?? $('#link-form').dataset.base;
+  linkDrafts.set(key, { latency: $('#link-latency').value, bandwidth: $('#link-bandwidth').value, blocked: $('#link-blocked').checked, base });
+  renderDirty = true;
+}
+$('#link-form').addEventListener('input', saveLinkDraft);
+$('#link-form').addEventListener('change', saveLinkDraft);
+$('#link-use-latest').onclick = () => { if (!linkSel) return; linkDrafts.delete(linkDraftKey()); $('#link-form').dataset.key = ''; renderDirty = true; render(); };
+$('#link-form').addEventListener('submit', guard(async e => {
+  e.preventDefault();
+  if (!linkSel || !run) return;
+  const { a, b, dir } = linkSel, [from, to] = linkEnds(), key = linkDraftKey(), submitted = linkDrafts.get(key);
+  const latency = String($('#link-latency').value).trim(), bandwidth = String($('#link-bandwidth').value).trim();
+  const valid = (text, min, max) => /^\d+$/.test(text) && Number(text) >= min && Number(text) <= max;
+  if (!valid(latency, 0, 30000) || !valid(bandwidth, 1, 100000)) {
+    popoverError = { target: currentTargetKey(), message: '延迟须为 0–30000 的整数毫秒，带宽须为 1–100000 的整数 KiB/s。' };
+    renderDirty = true; render(); return;
+  }
+  await mutate({ key: `${run.id}:link:${pairKey(a, b)}`, fault: true, path: `/api/runs/${run.id}/faults`,
+    body: { kind: 'link', from, to, latency: Number(latency), bandwidth: Number(bandwidth), blocked: $('#link-blocked').checked, bidirectional: dir === 'both' },
+    // Edits typed while the request was in flight are newer than what was sent; keep them.
+    success: (result, current) => { if (linkDrafts.get(key) === submitted) linkDrafts.delete(key); if (current) { if (!linkDrafts.has(key)) $('#link-form').dataset.key = ''; notify('链路设置已应用并归档'); } } });
+}));
+$('#heal-links').onclick = guard(async () => {
+  if (!run) return;
+  await mutate({ key: `${run.id}:heal`, scope: 'run', fault: true, path: `/api/runs/${run.id}/faults`, body: { kind: 'heal' },
+    success: (result, current) => { if (current) notify('已恢复全部链路的默认设置'); } });
+});
+$('#view-error').onclick = () => { $('#run-error-details').open = true; $('#run-error').scrollIntoView?.({ block: 'nearest' }); $('#run-error-details summary')?.focus?.(); };
 $('#play').onclick = () => {
   if (!run) return;
   if (live) { live = false; playing = false; }
@@ -616,10 +910,22 @@ $('#speed').onchange = e => {
   renderDirty = true; render();
 };
 $('#go-live').onclick = () => { live = true; playing = false; cursor = events.length; playTime = latestTime; spaceFollow = true; renderDirty = true; render(); };
-$('#reset-view').onclick = () => { selected = 'node-1'; spaceFollow = true; renderDirty = true; render(); };
+$('#reset-view').onclick = () => { closePopover(); selected = 'node-1'; spaceFollow = true; graphStamp = ''; renderDirty = true; render(); };
 $('#event-filter').onchange = () => { renderDirty = true; render(); };
 $('#event-search').oninput = () => { renderDirty = true; render(); };
-$('#stop-run').onclick = guard(async () => { if (!run) return; await api(`/api/runs/${run.id}/stop`, {}); run.status = 'completed'; renderDirty = true; await refreshRuns(); notify('实验已结束，完整记录已保存'); });
+$('#stop-run').onclick = guard(async () => {
+  if (!run || stopPending || run.status !== 'running') return;
+  const token = { loadGen: loadingRun, runId: run.id, scope: 'run' };
+  stopPending = true; renderDirty = true; render();
+  try {
+    const info = await api(`/api/runs/${run.id}/stop`, {});
+    if (isCurrent(token)) {
+      if (terminalStatuses.has(info.status)) run.status = info.status;
+      markActiveStatus(run.id, run.status); notify('实验已结束，完整记录已保存');
+    }
+    await refreshRuns();
+  } finally { stopPending = false; renderDirty = true; }
+});
 $('#export-run').onclick = () => { if (run) location.href = `/api/runs/${run.id}/export`; else notify('请先创建实验'); };
 function protocolChanged() {
   const form=$('#project-form'), protocol=form.elements.protocol.value;
@@ -658,32 +964,38 @@ function renderLibrary() {
     const el=$(selector);el.hidden=!active || (selector==='#running-elsewhere' && active.id===experiment?.id && run?.id===active.latestRun?.id);
     el.innerHTML=active?`<span><i class="status-dot"></i><strong>${esc(active.name)}</strong> 正在${active.latestRun.status==='starting'?'启动':'运行'}</span><button class="button small" data-experiment="${esc(active.id)}" data-active-run="true">进入可视化 →</button>`:'';
   }
-  $('#new-run').disabled=!!active;
-  $('#new-run').innerHTML=`${icon('play')} ${active?.id===experiment?.id?'运行中':'运行实验'}`;
+  renderDirty=true;
 }
 async function refreshRuns() {
-  const id=experiment?.id;
+  const seq=++refreshSeq,id=experiment?.id;
   const [items,parents,history]=await Promise.all([api('/api/experiments'),api('/api/protocol-projects'),id?api(`/api/experiments/${id}/runs`):Promise.resolve([])]);
+  // Polls overlap with explicit refreshes; a response older than one already applied is dropped.
+  if(seq<refreshApplied)return;
+  refreshApplied=seq;
   protocolProjects=parents;
-  experiments=items;renderLibrary();$('#connection-status').textContent='已连接';
+  experiments=items;
+  // A poll that started before a lifecycle event must not bring an ended run back to life.
+  if(run)markActiveStatus(run.id,run.status);
+  renderLibrary();$('#connection-status').textContent='已连接';
   if(id!==experiment?.id)return;
   runs=history;$('#history-count').textContent=scopedRuns().length;
-  if(run){const current=runs.find(r=>r.id===run.id);if(current){run.status=current.status;latestTime=Math.max(latestTime,current.time);renderDirty=true;}}
+  if(run){const current=runs.find(r=>r.id===run.id);if(current){if(statusRank[current.status]>=(statusRank[run.status]??0))run.status=current.status;markActiveStatus(run.id,run.status);latestTime=Math.max(latestTime,current.time);renderDirty=true;}}
   if(workspaceView==='history')renderHistory();
 }
 function clearRun() {
   $('#run-details').open=false;
   ++loadingRun;stream?.close();stream=null;run=null;events=[];ends.clear();sends.clear();
-  live=false;playing=false;cursor=0;playTime=0;latestTime=0;graphStamp='';resetCache();populateNodes();
-  $('#node-panel').innerHTML='<div class="inspector-empty">运行实验后，选择节点查看状态。</div>';
-  delete $('#node-panel').dataset.stamp;$('#application-panel').innerHTML='';delete $('#application-panel').dataset.stamp;
-  $('#fault-history').textContent='暂无故障';$('#inject-fault').disabled=true;
+  live=false;playing=false;cursor=0;playTime=0;latestTime=0;graphStamp='';resetCache();liveState=null;populateNodes();
+  linkSel=null;popoverOpen=false;popoverError=null;$('#element-popover').hidden=true;
+  for(const id of ['#node-panel','#application-panel','#peer-links','#link-rules']){$(id).innerHTML='';delete $(id).dataset.stamp;}
+  $('#link-form').dataset.key='';
+  $('#fault-history').textContent='暂无故障';
   $('#event-dialog').close();renderDirty=true;render();
 }
 function viewWorkspace(view) {
   if(!experiment)return;
   $('#protocol-experiments-panel').hidden=true;
-  workspaceView=view;
+  workspaceView=view;setVisualMode(view==='visual');
   $('#code-dialog').hidden=view!=='code';$('#visual-panel').hidden=view!=='visual';$('#history-panel').hidden=view!=='history';
   $$('[data-workspace-view]').forEach(b=>{b.classList.toggle('selected',b.dataset.workspaceView===view);b.setAttribute('aria-current',b.dataset.workspaceView===view?'page':'false');});
   localStorage.setItem(`distvis-view:${experiment.id}`,view);
@@ -707,7 +1019,7 @@ async function openExperiment(id,preferredView) {
 }
 async function showLibrary() {
   stashDraft();++loadingExperiment;clearRun();experiment=null;protocolProject=null;runs=[];codeArchive=null;codeDrafts={};codeDirty=false;workspaceView='library';
-  $('#experiment-workbench').hidden=true;$('#experiment-library').hidden=false;
+  $('#experiment-workbench').hidden=true;$('#experiment-library').hidden=false;$('#experiment-tabs').hidden=true;setVisualMode(false);
   $('#breadcrumb-protocol').hidden=true;$('#breadcrumb-child-separator').hidden=true;$('#breadcrumb-experiment').textContent='';$('#breadcrumb-separator').hidden=true;$('#nav-library').classList.add('active');
   localStorage.setItem('distvis-last-experiment','');localStorage.setItem('distvis-last-protocol','');window.history?.replaceState(null,'','#library');
   await refreshRuns();
@@ -738,7 +1050,11 @@ $('#create-experiment').onclick=$('#create-experiment-side').onclick=guard(()=>o
 for(const selector of ['#experiment-cards','#imported-cards','#recent-experiments','#active-experiment-notice','#running-elsewhere'])$(selector).onclick=guard(e=>{const p=e.target.closest('[data-protocol-project]');if(p)return openProtocol(p.dataset.protocolProject);const b=e.target.closest('[data-experiment]');if(b)return openExperiment(b.dataset.experiment,b.dataset.activeRun?'visual':undefined);});
 $('#experiment-search').oninput=renderLibrary;
 $('#nav-library').onclick=$('#breadcrumb-home').onclick=guard(showLibrary);
-$('#new-run').onclick=guard(configureRun);
+$('#new-run').onclick=$('#history-run').onclick=guard(()=>{
+  const state=runControlState();
+  if(['stop','starting'].includes(state.mode))return viewWorkspace('visual');
+  return state.mode==='goto'?openExperiment(state.experimentId,'visual'):configureRun();
+});
 $('#project-form').elements.protocol.onchange=protocolChanged;
 $('#project-form').onsubmit=guard(async e=>{
   e.preventDefault();const button=e.target.querySelector('[type="submit"]');button.disabled=true;
@@ -785,8 +1101,8 @@ function openDocumentation(e) {
 }
 $('#nav-guide').onclick=openDocumentation;
 $('.mobile-docs').onclick=openDocumentation;
-document.addEventListener('click',e=>{for(const menu of $$('.more-menu[open]'))if(!menu.contains(e.target))menu.open=false;});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')for(const menu of $$('.more-menu[open]'))menu.open=false;});
+document.addEventListener('click',e=>{for(const menu of $$('.more-menu[open], .legend-menu[open]'))if(!menu.contains(e.target))menu.open=false;});
+
 $$('.close-dialog').forEach(b=>{b.onclick=()=>b.closest('dialog').close();});
 $$('dialog').forEach(d=>{d.addEventListener('click',e=>{if(e.target===d&&(e.clientX<d.getBoundingClientRect().left||e.clientX>d.getBoundingClientRect().right||e.clientY<d.getBoundingClientRect().top||e.clientY>d.getBoundingClientRect().bottom))d.close();});});
 let codeFile = 'main.go', codeArchive = null;
@@ -933,7 +1249,7 @@ function renderProtocolShell(){
   $('#workspace-description').textContent=child?`${experiment.settings.nodeCount} 节点 · ${experiment.settings.latency} ms · ${experiment.settings.runtime}`:'';
   $('#breadcrumb-protocol').hidden=false;$('#breadcrumb-protocol').textContent=protocolProject.name;
   $('#breadcrumb-separator').hidden=false;$('#breadcrumb-child-separator').hidden=!child;$('#breadcrumb-experiment').textContent=child?experiment.name:'';
-  $('#new-run').hidden=!child;$('#workspace-new-experiment').hidden=child;
+  $('#workspace-new-experiment').hidden=child;
   $('#workspace-save-state').hidden=child;$('#nav-library').classList.remove('active');
   $('#protocol-experiment-count').textContent=experiments.filter(e=>e.protocolId===protocolProject.id).length;
 }
@@ -948,7 +1264,7 @@ function renderChildren(){
 }
 function showProtocolView(view){
   if(!protocolProject)return;
-  workspaceView=view;renderProtocolShell();
+  workspaceView=view;setVisualMode(false);renderProtocolShell();
   $('#code-dialog').hidden=view!=='code';$('#protocol-experiments-panel').hidden=view!=='experiments';$('#visual-panel').hidden=true;$('#history-panel').hidden=true;
   $('#protocol-code-tab').classList.toggle('selected',view==='code');$('#protocol-experiments-tab').classList.toggle('selected',view==='experiments');
   window.history?.replaceState(null,'',`#protocol/${protocolProject.id}/${view}`);
@@ -1016,14 +1332,34 @@ async function restoreRoute() {
   render();
 }
 window.addEventListener('hashchange',guard(restoreRoute));
-function setSidebar(collapsed){
-  document.body.classList.toggle('sidebar-collapsed',collapsed);
-  const label=collapsed?'展开侧栏':'折叠侧栏';
-  $('#toggle-sidebar').setAttribute('aria-expanded',String(!collapsed));
+// The visualization hides navigation into a temporary drawer; the saved sidebar preference
+// only governs the other views and is never written from here.
+function updateSidebarToggle(){
+  const visual=document.body.classList.contains('visual-mode');
+  const expanded=visual?drawerOpen:!document.body.classList.contains('sidebar-collapsed');
+  const label=visual?(drawerOpen?'隐藏导航':'显示导航'):(expanded?'折叠侧栏':'展开侧栏');
+  $('#toggle-sidebar').setAttribute('aria-expanded',String(expanded));
   $('#toggle-sidebar').setAttribute('aria-label',label);$('#toggle-sidebar').title=label;
 }
+function setSidebar(collapsed){document.body.classList.toggle('sidebar-collapsed',collapsed);updateSidebarToggle();}
+function setDrawer(open){drawerOpen=open;document.body.classList.toggle('drawer-open',open);updateSidebarToggle();}
+function setVisualMode(on){document.body.classList.toggle('visual-mode',on);setDrawer(false);}
 setSidebar(localStorage.getItem('distvis-sidebar-collapsed')==='true');
-$('#toggle-sidebar').onclick=()=>{const collapsed=!document.body.classList.contains('sidebar-collapsed');setSidebar(collapsed);localStorage.setItem('distvis-sidebar-collapsed',String(collapsed));};
+$('#toggle-sidebar').onclick=()=>{
+  if(document.body.classList.contains('visual-mode')){setDrawer(!drawerOpen);if(drawerOpen)$('#nav-library').focus();return;}
+  const collapsed=!document.body.classList.contains('sidebar-collapsed');setSidebar(collapsed);localStorage.setItem('distvis-sidebar-collapsed',String(collapsed));
+};
+document.addEventListener('click',e=>{if(drawerOpen&&!e.target.closest('.sidebar, #toggle-sidebar'))setDrawer(false);});
+// Escape closes the innermost layer: menus, then the drawer, then link mode, then the popover.
+// Open modal dialogs handle Escape themselves.
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape'||$$('dialog').some(d=>d.open))return;
+  const menus=$$('.more-menu[open], .legend-menu[open]');
+  if(menus.length){menus.forEach(menu=>{menu.open=false;});return;}
+  if(drawerOpen){setDrawer(false);$('#toggle-sidebar').focus();return;}
+  if(!popoverOpen)return;
+  if(linkSel)openNodePopover(linkSel.origin.node,`[data-node="${linkSel.origin.node}"]`);else closePopover();
+});
 async function init() {
   await refreshProtocols();await migrateBrowserDraft();await refreshRuns();
   await migrateExperimentDrafts();await refreshRuns();await restoreRoute();

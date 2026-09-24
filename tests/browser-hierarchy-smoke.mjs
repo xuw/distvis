@@ -20,12 +20,13 @@ async function createChild(label,count,latency){
   await page.locator('#new-form [name="latency"]').fill(String(latency));
   await page.locator('#new-form [name="runtime"]').selectOption(runtime);
   await page.locator('#run-submit').click();
-  await page.locator('#workspace-title').filter({hasText:label}).waitFor();
+  await page.locator('#breadcrumb-experiment').filter({hasText:label}).waitFor();
   const e=(await api(`/api/protocol-projects/${parent}/experiments`)).find(e=>e.name===label);
   assert.equal(e.protocolId,parent);assert.equal(e.runCount,0,'creation does not start nodes');return e.id;
 }
 async function start(id){
-  await page.locator('#new-run').click();
+  // A run can be started from the visualization strip or from the run history.
+  await page.locator(await page.locator('#visual-panel').isVisible()?'#new-run':'#history-run').click();
   await page.locator('#new-dialog[open]').waitFor();
   assert.equal(await page.locator('#new-form [name="protocol"]').count(),0);
   const config=(await api(`/api/experiments/${id}`)).settings;

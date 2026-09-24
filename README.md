@@ -1,12 +1,12 @@
 # DistVis
 
-用户开发文档：[Go API](docs/GO-API.md) · [平台 HTTP API](docs/PLATFORM-API.md) · [Agent / MCP / skill](docs/AGENT.md)。启动平台后，从侧栏「API 文档」打开；也可直接访问 [/docs/go](http://localhost:3000/docs/go) 和 [/docs/platform](http://localhost:3000/docs/platform)，支持搜索、目录跳转、代码复制和 Markdown 下载。
+用户开发文档：[Go API](docs/GO-API.md) · [平台 HTTP API](docs/PLATFORM-API.md) · [Agent / MCP / skill](docs/AGENT.md)。启动平台后，从侧栏「API 文档」打开（可视化页面中侧栏收起为导航抽屉，点击左上角 ☰ 打开）；也可直接访问 [/docs/go](http://localhost:3000/docs/go) 和 [/docs/platform](http://localhost:3000/docs/platform)，支持搜索、目录跳转、代码复制和 Markdown 下载。
 
 文档示例验收：`node tests/docs-container-smoke.mjs` 在空闲平台运行原样下载的 Ping 程序，记录自动归档；`node tests/browser-docs-smoke.mjs` 检查文档导航、搜索、复制和移动布局（需 Playwright）。平台 API 文档中的 `demo.mjs` 可直接执行完整的创建、输入、故障和导出流程。
 
 面向分布式系统教学的本地实验工作台：实现协议、运行节点、注入故障，并按事件逐步回放。
 
-已实现内置教学仿真、Go SDK、Docker / Docker Desktop K8s 运行适配、拓扑消息动画、节点检查器、故障面板、代码草稿、事件检索、历史回放和 JSON 导出。首批示例为 **Raft 选主、令牌环互斥、LWW 副本存储**。
+已实现内置教学仿真、Go SDK、Docker / Docker Desktop K8s 运行适配、拓扑消息动画、节点 / 链路操作面板、代码草稿、事件检索、历史回放和 JSON 导出。首批示例为 **Raft 选主、令牌环互斥、LWW 副本存储**。
 
 支持 **普通 `net/rpc` 和 gRPC unary 服务**：从 Go 参数类型 / protobuf 自动生成应用输入表单，标准客户端调用自动记录请求、返回及错误。用户可指定本地协议根目录，每个子目录一个 Go module，平台自动发现、挂载并运行。接入说明见 [Go API](docs/GO-API.md)，可运行示例在 [protocols/](protocols/)。
 
@@ -123,14 +123,14 @@ func main() {
 - `node.ID` / `node.Nodes`：本节点和所有节点的逻辑地址，如 `node-1`。不需要管理 IP、端口或 DNS。
 - `Send(to, payload)`：提交 JSON 消息；成功表示提交给 coordinator，不保证送达。
 - `Receive(ctx)`：读取消息并自动记录接收确认。
-- `Report(state)`：汇报任意 JSON 可序列化状态，立即出现在节点检查器。
+- `Report(state)`：汇报任意 JSON 可序列化状态，立即出现在节点操作面板。
 - `DeclareInput([]sdk.InputAction)`：节点程序声明应用层输入，浏览器自动生成表单；通过 `node.Commands` 接收 `{id, action, values}`，`cmd.Values` 是保留数字、布尔值、对象等类型的 `json.RawMessage`。
 - `sdk.Save(value)` / `sdk.Load(&value)`：将协议状态写入工作目录的 `state.json`。示例持久化 Raft term/votedFor。
 - stdout 是 SDK 的 JSON 协议通道；普通调试日志写 stderr。
 
 ### 协议声明应用输入
 
-点击节点，在「应用层输入」中填写并发送。输入作用于正在运行的实时节点；暂停或查看过去不会把输入发送到过去。离线节点和已结束实验不可提交。输入声明、完整字段、输入失败和后续协议消息均进入实验历史；时空图用蓝色菱形标记应用输入。
+点击节点（或节点左上角的蓝色「输入」徽标，直接进入第一个输入框），在弹出面板的「应用输入」中填写并发送。节点声明多个操作时，先选择操作再填写。输入作用于正在运行的实时节点；暂停或查看过去不会把输入发送到过去。离线节点和已结束实验不可提交。输入声明、完整字段、输入失败和后续协议消息均进入实验历史；时空图用蓝色菱形标记应用输入。
 
 RPC 协议只需标记应用服务：字段自动从方法签名提取，既不写 `DeclareInput`，也不手工收取 `Commands`。下面的显式声明保留给低层消息 SDK 和特殊表单需求。
 
@@ -170,7 +170,10 @@ for cmd := range node.Commands {
 ## 故障与回放
 
 - 节点崩溃 / 恢复。
-- 任意两节点之间的**有向链路**中断、固定延迟和带宽限制；可以勾选同时应用反方向。
+- 任意两节点之间的**有向链路**中断、固定延迟和带宽限制；可以选择 A→B、B→A 或双向。只修改一个方向时，另一方向的规则保持不变；两个方向规则不同时选择「双向」会先提示覆盖。
+- 所有针对某个节点或链路的操作都在同一个弹出面板中完成：点击节点，面板依次显示应用输入、崩溃 / 恢复、与其他节点的链路和当前状态；点击连线（或面板中的链路行）直接编辑这条链路，无需再次选择目标。Esc 逐层关闭：链路 → 节点 → 面板。手机宽度下面板变为底部抽屉。
+- 「恢复全部链路」和最近故障记录位于顶部控制条的「网络」菜单，随时可用。它只重置链路的延迟、带宽和中断，不会恢复已崩溃的节点。
+- 面板中的操作按钮、链路规则和最近故障始终读取实时状态，并标注「实时」；节点状态行跟随回放位置，并标注「回放 @ 时间」。
 - 带宽单位为 **KiB/s**，按消息 JSON 的 UTF-8 字节数计算，同方向消息排队，两个方向独立。
 - 故障在运行过程中生效，已在途消息会检查接收时的链路及节点代次。崩溃前的消息不会在重启后突然恢复。
 - 暂停、慢放、单步和拖动时间轴只改变**观察位置**，后台协议仍在运行。故障和写入始终作用于当前实时实验。
@@ -178,7 +181,7 @@ for cmd := range node.Commands {
 - 「拓扑动画 / 时空图」可随时切换，共用同一播放位置和速度。时空图时间从左到右，每个节点独占一行。按住图面左右拖动、横向滚轮或 Shift + 滚轮可平移，也可用底部滑块、箭头按钮或聚焦图面后的左右方向键；「回到播放位置」恢复跟随。平移只改变视野，不改变回放进度，也不会展示尚未回放的事件。较多节点可以上下滚动。
 - 时空图默认每屏 1 秒，可缩放到 100/250/500 毫秒或 2/5/10/30 秒。支持按节点筛选、隐藏心跳与回复；重叠标签自动隐藏，悬停或聚焦显示，点击箭头查看完整内容。重复的相同状态上报只从图中省略，原始日志保留。
 - 时空图显示截至回放位置的发送、接收、丢弃、状态与故障：实线表示已接收，虚线表示尚未接收，红色 × 表示丢弃。每个窗口最多显示最近 250 条消息、150 个状态变化/故障标记，并显示实际计数；可放大时间轴或用事件流查看其他记录。
-- 拓扑消息使用方向箭头，标签包含 payload 关键字段；点击箭头暂停在当前观察位置，查看发送/接收节点、消息 ID、时间和 payload。节点面板按字段展示主要状态，完整 JSON 可展开查看。时空图中的节点、消息和状态标记也可点击，支持键盘 Tab / Enter。
+- 拓扑消息使用方向箭头，标签包含 payload 关键字段；点击箭头暂停在当前观察位置，查看发送/接收节点、消息 ID、时间和 payload。节点操作面板按字段展示主要状态，完整 JSON 可展开查看。时空图中的节点、消息和状态标记也可点击，支持键盘 Tab / Enter。
 - 事件按 coordinator 时间和单调序号排序，发送/接收通过消息 ID 关联。动画短消息采用至少 550ms 的展示时间便于观察；准确时刻以事件日志为准。
 - 历史回放重建记录中的状态，不重新执行用户代码。固定种子可复现内置仿真；真实 Go 程序不保证可重复调度。
 
@@ -223,12 +226,13 @@ DISTVIS_NODE_BINARY=/tmp/distvis-go-node node --test tests/native.test.js
 - 4 项构建配置与错误诊断测试：显式仓库地址、自定义基础镜像、403 加速器错误及 Go 编译错误区分。
 - 5 项 Go SDK 测试，以及 Go 示例编译。
 - 3 项真实 Go 多进程集成测试：Raft 崩溃与持久状态恢复、LWW 分区收敛、令牌环互斥。
-- DOM 交互检查：创建实验、5 节点拓扑、暂停/单步/实时、节点故障与恢复、结束实验、历史回放、源码编辑器。
+- DOM 交互检查：创建实验、5 节点拓扑、暂停/单步/实时、节点弹出面板中的故障与恢复、单向 / 双向链路编辑与覆盖提示、恢复全部链路、回放时操作仍读取实时状态、输入草稿在实时更新中保留、切换目标后迟到的响应不再提示、启动失败事件、结束实验、历史回放、源码编辑器。
 - 回放增强检查：0.01× 实际时钟推进、方向箭头、时空图切换、消息内容转义、节点主要状态、相同时间戳的事件顺序、未接收/已接收/丢弃/自身消息的展示隔离。
 
 - 2026-09-18 本机 Docker 实测：三个协议分别启动 5 个真实 Go 容器；验证 Raft 实际容器崩溃/恢复与重选、令牌互斥、LWW 分区后的收敛、SDK 接收记录、历史导出及资源回收。
 - 2026-09-18 Docker Desktop K8s 实测：三个协议分别启动 5 个 Pod，验证上述协议行为、Go 进程崩溃/恢复、namespace 和镜像回收。
 - Chrome 浏览器实测：创建实验、故障操作、时空图替换拓扑、消息详情、节点状态、历史回放、0.01× 速度和 390px 手机布局；截图见 `artifacts/desktop.png`、`artifacts/spacetime.png`、`artifacts/mobile.png`。
+- 布局验收：`tests/browser-layout-smoke.mjs` 在 1440×900 下检查图区以上的界面高度不超过 104px、图区高度不低于视口的 60%、侧栏收起且不改变已保存的侧栏偏好、弹出面板不遮挡所点节点并在实时重绘中保持焦点和位置、Esc 逐层关闭；在 390×844 下检查无横向滚动、图区不低于 300px、控制条按钮不小于 40px、面板变为底部抽屉；并检查 2 / 5 / 12 节点的布局（12 节点在窄屏下图区内部滚动）。截图见 `artifacts/layout-desktop.png`、`artifacts/layout-mobile.png`。
 - 应用输入：通用 schema 校验、按节点声明、数字/布尔值/嵌套 JSON、令牌互斥与 payload、Raft 提案转发及分区等待均经过测试。三个内置示例均通过真实 Docker 输入验收；自定义 Go 节点的动态表单和完整字段传输通过 Chrome 实测，见 `tests/browser-input-smoke.mjs`、`artifacts/application-input.png`。
 - RPC 与目录项目：Go race 测试覆盖标准 net/rpc Call/Go、gRPC 生成客户端、protobuf int64 精度、metadata、错误码、deadline 与丢失响应；Docker 和 K8s 均实际运行了 net/rpc / gRPC 多节点目录项目，并验证只读挂载、Pod 初始化编译、故障和源码归档。脚本见 `tests/rpc-project-smoke.mjs`（`DISTVIS_RUNTIME=kubernetes` 切换 K8s），结果在 `artifacts/rpc-*-acceptance.json`。
 - 协议 / 实验层级：Chrome 与真实 Docker 验证同一协议下两个实验共用 Go 代码、参数和故障独立、三次运行使用正确代码版本、旧快照不变、历史隔离及手机布局。见 `tests/browser-hierarchy-smoke.mjs`、`artifacts/protocol-hierarchy-docker.json`；`tests/browser-workspace-smoke.mjs` 保留为兼容入口。可用 `DISTVIS_RUNTIME=kubernetes` 切换环境。
@@ -252,6 +256,13 @@ node tests/browser-smoke.mjs
 ```
 
 该检查会创建并结束一个仿真实验，将桌面和手机宽度截图保存在 `artifacts/`。
+
+一次运行全部浏览器与 DOM 验收（需要空闲的本地平台；输入、RPC 和层级验收会构建真实 Docker Go 节点）：
+
+```bash
+npm install --no-save --package-lock=false playwright linkedom
+DISTVIS_URL=http://localhost:3000 npm run test:browser
+```
 
 只做 DOM 交互检查时，无需启动服务或浏览器：
 

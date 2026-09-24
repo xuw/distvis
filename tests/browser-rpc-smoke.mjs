@@ -33,7 +33,7 @@ try{
   await page.locator('#workspace-new-experiment').click();
   await page.locator('#new-form [name="name"]').fill('独立参数实验');
   await page.locator('#run-submit').click();
-  await page.locator('#workspace-title').filter({hasText:'独立参数实验'}).waitFor();
+  await page.locator('#breadcrumb-experiment').filter({hasText:'独立参数实验'}).waitFor();
   await page.locator('#new-run').click();
   await page.locator('#new-dialog[open]').waitFor();
   await page.locator('#new-form [name="runtime"]').selectOption('docker');
@@ -43,6 +43,8 @@ try{
   await page.locator('#new-form [type="submit"]').click();
   await page.waitForFunction(()=>localStorage.getItem('distvis-run:'+localStorage.getItem('distvis-last-experiment')));
   id=await page.evaluate(()=>localStorage.getItem('distvis-run:'+localStorage.getItem('distvis-last-experiment')));
+  // Application input lives in the node popover.
+  await page.locator('#graph [data-node="node-1"]').click();
   await page.locator('#application-panel [name="number"]').waitFor({timeout:600000});
   assert.equal(await page.locator('#application-panel form').count(),1,'internal RPC is hidden');
   await page.locator('#application-panel [name="number"]').fill('9223372036854775807');

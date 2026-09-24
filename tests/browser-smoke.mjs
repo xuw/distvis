@@ -16,7 +16,7 @@ try {
   await page.locator('#workspace-new-experiment').click();
   await page.locator('#new-form [name="name"]').fill('独立参数实验');
   await page.locator('#run-submit').click();
-  await page.locator('#workspace-title').filter({hasText:'独立参数实验'}).waitFor();
+  await page.locator('#breadcrumb-experiment').filter({hasText:'独立参数实验'}).waitFor();
   await page.locator('#new-run').click();
   await page.locator('#new-dialog[open]').waitFor();
   await page.locator('#new-form [name="name"]').fill('浏览器验收 · Raft');
@@ -38,13 +38,11 @@ try {
   await page.locator('#step').click();
   assert.equal(await page.locator('#event-count').textContent(), '1');
   await page.locator('#go-live').click();
-  await page.locator('[data-tab="fault"]').click();
-  await page.locator('#fault-kind').selectOption('crash');
-  await page.locator('#fault-node').selectOption('node-1');
-  await page.locator('#inject-fault').click();
+  // One click selects the target, one click injects the fault.
+  await page.locator('#graph [data-node="node-1"]').click();
+  await page.locator('#node-toggle[data-node-action="crash"]').click();
   await page.waitForFunction(() => document.querySelectorAll('.node-offline').length === 1);
-  await page.locator('#fault-kind').selectOption('recover');
-  await page.locator('#inject-fault').click();
+  await page.locator('#node-toggle[data-node-action="recover"]').click();
   await page.waitForFunction(() => document.querySelectorAll('.node-offline').length === 0);
   await page.locator('#stop-run').click();
   await page.locator('#run-status').filter({ hasText: '已结束' }).waitFor();

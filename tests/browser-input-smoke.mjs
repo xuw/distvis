@@ -17,7 +17,10 @@ const errors = [];
 page.on('pageerror', e => errors.push(e.message));
 try {
   await page.goto(`${base}/#experiment/${run.config.experimentId}/visual`);
-  await page.locator('#application-panel [name="text"]').waitFor({ timeout: 360000 });
+  // Nodes that declare inputs carry a badge; activating it opens the popover at the first field.
+  await page.locator('#graph [data-input-node="node-1"]').click({ timeout: 360000 });
+  await page.locator('#application-panel [name="text"]').waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement?.name), 'text', 'badge focuses the first input field');
   const panel = page.locator('#application-panel');
   await panel.locator('[name="text"]').fill('输入 <script> & 中文');
   await panel.locator('[name="count"]').fill('0');
