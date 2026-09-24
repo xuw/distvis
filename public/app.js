@@ -38,9 +38,14 @@ let cache, cacheCursor = -1, renderDirty = true, latestTime = 0, lastFrame = 0, 
 let linkSel = null, popoverOpen = false, popoverOrigin = null, popoverError = null;
 // Controls act on the running experiment, so they read this projection of every received event,
 // never the replay snapshot, which stops at the playback cursor.
-let liveState, liveRev = 0, faultBusy = 0, stopPending = false, refreshSeq = 0, refreshApplied = 0, drawerOpen = false;
+let liveState, liveRev = 0, refreshSeq = 0, refreshApplied = 0, drawerOpen = false;
 let graphBox = { width: 0, height: 0 };
 const pending = new Set(), linkDrafts = new Map(), inputActions = new Map();
+// Busy state belongs to the run that sent the request: a slow reply from an earlier run never
+// disables the controls of the run on screen.
+const faultsInFlight = new Map(), stopsInFlight = new Set();
+function faultBusy(runId = run?.id) { return (faultsInFlight.get(runId) || 0) > 0; }
+function stopPending(runId = run?.id) { return stopsInFlight.has(runId); }
 const terminalStatuses = new Set(['completed', 'failed', 'interrupted']);
 // A run only moves forward through these; an older snapshot never moves it back.
 const statusRank = { created: 0, starting: 1, running: 2, completed: 3, failed: 3, interrupted: 3 };
@@ -436,7 +441,7 @@ function isCurrent(token) {
 async function mutate({ key, path, body, fault = false, scope = 'target', success }) {
   if (!run) throw new Error('请先运行实验');
   const token = { loadGen: loadingRun, runId: run.id, key, scope };
-  pending.add(key); if (fault) faultBusy++;
+  pending.add(key); if (fault) faultsInFlight.set(token.runId, (faultsInFlight.get(token.runId) || 0) + 1);
   if (isCurrent(token)) popoverError = null;
   renderDirty = true; render();
   try {
@@ -449,7 +454,8 @@ async function mutate({ key, path, body, fault = false, scope = 'target', succes
       notify(error.message);
     }
   } finally {
-    pending.delete(key); if (fault) faultBusy = Math.max(0, faultBusy - 1);
+    pending.delete(key);
+    if (fault) { const left = (faultsInFlight.get(token.runId) || 1) - 1; if (left > 0) faultsInFlight.set(token.runId, left); else faultsInFlight.delete(token.runId); }
     renderDirty = true;
   }
 }
@@ -544,7 +550,7 @@ $('#application-panel').addEventListener('submit', guard(async e => {
     success: (result, current) => { if (current) notify(`应用输入已发送 · #${result.commandSeq}`); } });
 }));
 function faultBlockReason() {
-  return run.status !== 'running' ? '实验未运行，无法注入故障。' : faultBusy ? '上一项故障操作正在执行…' : '';
+  return run.status !== 'running' ? '实验未运行，无法注入故障。' : faultBusy() ? '上一项故障操作正在执行…' : '';
 }
 function renderNodePopover(state) {
   const node = selected, online = liveOnline(node);
@@ -702,9 +708,9 @@ function renderControls() {
   const state = runControlState(), start = $('#new-run'), stop = $('#stop-run');
   stop.hidden = !['stop', 'starting'].includes(state.mode); start.hidden = !stop.hidden;
   if (!stop.hidden) {
-    const label = state.mode === 'starting' ? '启动中…' : stopPending ? '正在结束…' : '结束实验';
+    const label = state.mode === 'starting' ? '启动中…' : stopPending() ? '正在结束…' : '结束实验';
     if (stop.dataset.label !== label) { stop.dataset.label = label; stop.innerHTML = icon('stop') + label; }
-    stop.disabled = state.mode === 'starting' || stopPending;
+    stop.disabled = state.mode === 'starting' || stopPending();
     stop.title = state.mode === 'starting' ? '节点构建完成后才能结束实验' : '';
   } else {
     const label = { run: '运行实验', rerun: '重新运行', failed: '重新运行', goto: '前往运行中的实验' }[state.mode];
@@ -948,9 +954,9 @@ $('#reset-view').onclick = () => { closePopover(); selected = 'node-1'; spaceFol
 $('#event-filter').onchange = () => { renderDirty = true; render(); };
 $('#event-search').oninput = () => { renderDirty = true; render(); };
 $('#stop-run').onclick = guard(async () => {
-  if (!run || stopPending || run.status !== 'running') return;
+  if (!run || stopPending() || run.status !== 'running') return;
   const token = { loadGen: loadingRun, runId: run.id, scope: 'run' };
-  stopPending = true; renderDirty = true; render();
+  stopsInFlight.add(token.runId); renderDirty = true; render();
   try {
     const info = await api(`/api/runs/${token.runId}/stop`, {});
     markActiveStatus(token.runId, info.status);
@@ -959,7 +965,7 @@ $('#stop-run').onclick = guard(async () => {
   } catch (error) {
     // A failure for a run the user has already left is not reported on the page they are now on.
     if (isCurrent(token)) notify(error.message);
-  } finally { stopPending = false; renderDirty = true; }
+  } finally { stopsInFlight.delete(token.runId); renderDirty = true; }
 });
 $('#export-run').onclick = () => { if (run) location.href = `/api/runs/${run.id}/export`; else notify('请先创建实验'); };
 function protocolChanged() {

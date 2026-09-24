@@ -140,7 +140,7 @@ document.querySelector('#toast').textContent='';
 vm.runInContext("pendingHeal=document.querySelector('#heal-links').onclick();loadingRun++;",context);
 await vm.runInContext('pendingHeal',context);await delay();await sync();
 assert.equal(document.querySelector('#toast').textContent,'','no notice for a run the user left');
-assert.equal(vm.runInContext('pending.size + faultBusy',context),0,'pending state is released');
+assert.equal(vm.runInContext('pending.size + faultsInFlight.size',context),0,'pending state is released');
 // A late failure for one input action must not appear after the user switched to another action.
 vm.runInContext("savedSchemas=liveState.schemas['node-1'];liveState.schemas['node-1']=[{action:'first',label:'First',fields:[]},{action:'second',label:'Second',fields:[]}];liveRev++;openNodePopover('node-1');",context);
 document.querySelector('#toast').textContent='';hold.post=true;
@@ -198,7 +198,22 @@ hold.post=true;const stopRequest=vm.runInContext("document.querySelector('#stop-
 vm.runInContext('loadingRun++',context);
 await releasePost(false);await stopRequest;paint();
 assert.equal(document.querySelector('#toast').textContent,'','no stale stop failure notice');
-assert.equal(vm.runInContext('stopPending',context),false,'the stop button is released');
+assert.equal(vm.runInContext('stopsInFlight.size',context),0,'the stop button is released');
+// Busy state belongs to the run that sent the request: a slow fault or stop reply from this run
+// does not disable the controls of another running run shown meanwhile.
+hold.post=true;
+const slowFault=vm.runInContext("document.querySelector('#heal-links').onclick()",context);await delay();
+const slowStop=vm.runInContext("document.querySelector('#stop-run').onclick()",context);await delay();
+hold.post=false;
+assert.equal(document.querySelector('#heal-links').disabled,true,'the sending run shows its own busy state');
+vm.runInContext("busyRun=run;run={...run,id:'next-run',status:'running'};openNodePopover('node-1');",context);paint();
+assert.equal(document.querySelector('#heal-links').disabled,false,'another run keeps its fault controls');
+assert.equal(document.querySelector('#node-toggle').disabled,false);
+assert.equal(document.querySelector('#stop-run').disabled,false,'another run keeps its stop button');
+assert.equal(document.querySelector('#stop-run').textContent.trim(),'结束实验');
+while(heldPosts.length)await releasePost(false);await slowFault;await slowStop;
+assert.equal(vm.runInContext('faultsInFlight.size + stopsInFlight.size',context),0,'each request cleared only its own run');
+vm.runInContext("run=busyRun;closePopover();renderDirty=true;render();",context);
 // A poll that started while this run was active must not revive it after it ended and the user left it.
 const endedRunId=vm.runInContext('run.id',context);
 hold.get=true;const stalePoll=vm.runInContext('refreshRuns()',context);await delay();hold.get=false;
