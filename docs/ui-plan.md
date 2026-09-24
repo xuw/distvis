@@ -1,70 +1,348 @@
-# <Plan Title>
+# Simplified Experiment Visualization: Anchored Element Popover, Compact Shell, Clear Run Controls
 
 ## Goal Description
-<Clear, direct description of what needs to be accomplished>
+
+Simplify the DistVis experiment visualization view (`public/index.html`, `public/app.js`, `public/style.css`) so that the visualization takes up most of the screen and every action is close to the thing it acts on. The work covers all six user requirements in the original idea:
+
+- **R1** Make the interface simpler and show less unneeded information: remove duplicated and decorative information.
+- **R2** Put each node or edge's configuration and fault injection in **one** dialog. Remove the two tabs, and never ask the user to pick the target again inside fault injection.
+  - **User decision:** the dialog is a **floating popover anchored next to the clicked node or edge**.
+  - On phones (≤700px) it becomes a bottom sheet.
+- **R3** Make the header smaller so the visualization gets more room.
+- **R4** Make the start/end experiment buttons easy to find.
+- **R5** Make node input easier to see.
+- **R6** Remove the left sidebar or hide it automatically.
+
+**Primary direction (from the draft):** a selection-driven, unified element surface.
+- A selection is either a node or a link.
+- The surface shows state, app input and faults for whatever is selected.
+- The fault target comes from the selection, so the "Node details / Fault injection" tabs and the `#fault-kind`, `#fault-node`, `#fault-from`/`#fault-to` selects are removed.
+
+**User's choice of form:** the floating popover (draft Alt-3), not the docked panel recommended by both Claude and Codex.
+
+**Folded in from the draft's alternatives, as the synthesis notes suggested:**
+- the Alt-1 compact shell, drawer sidebar and resizable topology
+- the Alt-2 control strip driven by run state
+- the Alt-3 on-graph input badge
+- Alt-4 information pruning
+- Alt-5 measurable layout budgets
+
+**Scope clarification (user decision):** "node configuration" means app input, node faults and link settings only. Per-node program or code configuration stays in the protocol workspace.
+
+**Behaviour clarification (user decision):** faults and app inputs stay available during replay.
+- They always act on the live run.
+- Their state comes from live data and is clearly labelled "Live".
+
+This matches the documented rule in `README.md`: faults and writes always act on the current live experiment.
+
+**No server fault or command API changes are required.** The one server change is a `lifecycle {action:'failed'}` event on startup failure.
 
 ## Acceptance Criteria
 
 Following TDD philosophy, each criterion includes positive and negative tests for deterministic verification.
 
-- AC-1: <First criterion>
+- AC-1: One anchored popover replaces the tabbed inspector and the fault panel.
   - Positive Tests (expected to PASS):
-    - <Test case that should succeed when criterion is met>
-    - <Another success case>
+    - Clicking a topology node opens a popover next to that node containing, in order:
+      1. the header (name, live online badge)
+      2. Application input
+      3. a single crash/recover toggle
+      4. the peer-link list
+      5. replay state rows
+      6. a collapsed raw JSON disclosure
+    - Clicking a topology edge (`.link-hit`) opens the same popover in link mode for that pair. The endpoints are already filled in and no target select is shown.
+    - Crashing a node takes exactly two interactions: click the node, then click "Simulate crash".
+    - Clicking a different node or edge while the popover is open switches its content in place.
+    - Escape, the close button, or a click on empty graph background closes the popover.
   - Negative Tests (expected to FAIL):
-    - <Test case that should fail/be rejected when working correctly>
-    - <Another failure/rejection case>
-  - AC-1.1: <Sub-criterion if needed>
-    - Positive: <...>
-    - Negative: <...>
-- AC-2: <Second criterion>
-  - Positive Tests: <...>
-  - Negative Tests: <...>
-...
+    - Any of these still exists in the DOM: `.inspector-tabs`, `[data-tab="fault"]`, `#fault-kind`, `#fault-node`, `#fault-from`, `#fault-to`.
+    - A link fault that requires choosing source/target nodes from a dropdown.
+    - The popover is a descendant of `#graph` or `#spacetime`, so it would be destroyed by `innerHTML` redraws.
+  - AC-1.1: Anchoring and redraw stability.
+    - Positive:
+      - The popover stays next to its anchor after live redraws, playback, window resize and space-time panning.
+      - It flips side or clamps so it stays inside the visualization area.
+      - It never covers its own anchor element.
+    - Negative:
+      - The popover flickers, loses focus or resets when `#graph` is rebuilt during a live run.
+      - The popover extends past the viewport and causes page-level horizontal scroll.
+  - AC-1.2: Opening from the space-time view.
+    - Positive: clicking a space-time lane label opens the node popover anchored to that label. Its peer-link list gives access to link mode.
+    - Negative: link faults can only be reached from the topology view.
+
+- AC-2: Link rule direction semantics are explicit and never destroy data silently.
+  - Positive Tests:
+    - Link mode shows the live rule for both directions (A→B and B→A: latency, bandwidth, blocked, or default).
+    - A direction control offers A→B | B→A | Both.
+      - Opening from a graph edge defaults to lower-index → higher-index.
+      - Opening from the peer list defaults to selected-node → peer.
+    - Editing only A→B leaves an existing different B→A rule unchanged.
+    - When "Both" is chosen and the two rules differ, a visible notice says both directions will be overwritten with the same settings.
+    - Latency (0–30000) and bandwidth (1–100000) accept only integers within range.
+  - Negative Tests:
+    - Applying A→B changes B→A.
+    - Empty or out-of-range values are sent to `/api/runs/:id/faults`.
+
+- AC-3: Heal and fault history are always reachable.
+  - Positive Tests:
+    - A persistent "Network" control in the run control strip shows "Heal all links" (`heal`) and the last faults, whether or not a popover is open.
+    - The heal explanation is visible text: "Resets all link latency/bandwidth/blocking to defaults; does not recover crashed nodes".
+  - Negative Tests:
+    - Heal is reachable only through a specific selection state.
+    - The heal meaning is available only via a `title` tooltip.
+
+- AC-4: Mutations use live state and never replay state.
+  - Positive Tests:
+    - While replay is paused at a time when node-2 was online but node-2 is currently crashed live, the popover's toggle shows "Recover node", marked "Live".
+    - The state rows in the same popover show replay-time values, labelled "Replay @ mm:ss".
+    - Link-mode prefill, peer-link status and fault history come from live state.
+    - The latest `command_result` for the node is shown from live events regardless of the replay cursor.
+    - Replay and live snapshots use one shared pure event reducer.
+  - Negative Tests:
+    - Any mutation control reads the replay `snapshot()` cache for its enabled state, toggle choice or prefill.
+    - A command error does not appear until the cursor reaches it.
+
+- AC-5: Node input is prominent.
+  - Positive Tests:
+    - Nodes whose live input schema declares at least one action show an input badge (⌨) on the topology node card.
+    - Activating the badge opens the popover with focus in the first input field.
+    - Application input is the first content section of the node popover.
+    - With more than one action, a compact action chooser shows one expanded form.
+    - When the run is not running or the node is offline, submit is disabled and the reason is shown as visible text.
+  - Negative Tests:
+    - A badge appears on a node with no declared actions.
+    - A disabled submit has no visible reason.
+    - Every form of a 64-action schema is expanded at once.
+
+- AC-6: Drafts, focus and pending state survive live updates and navigation races.
+  - Positive Tests:
+    - Typed input values, caret position, IME composition and open disclosures survive live event redraws.
+    - Drafts are keyed by run plus node plus action for inputs, and by run plus canonical pair (`min>max`) plus direction for links.
+    - When a schema changes, draft values are kept for fields whose name and type still exist.
+    - If the live link rule changes while a link draft is dirty, the draft is kept and "Live rule changed · use latest values" is offered.
+    - Pending state is keyed per target. While any fault request is in flight, all fault controls are disabled, matching the server's run-level mutation lock. A 409 shows "Previous fault operation still in progress".
+    - Drafts survive a failed request.
+    - Every mutation captures `{loadGen, runId, targetKey}`. Result notices and inline renders apply only if all three still match.
+  - Negative Tests:
+    - A live redraw overwrites a field the user is editing.
+    - A delayed response from a previous run, or from a previously selected target, clears drafts, clears pending state or shows an inline result on the current target.
+
+- AC-7: The run control strip makes start and end obvious in every run state.
+  - Positive Tests:
+    - One strip at the top of the visualization panel holds a primary button, a status badge, the "Network" control, and a visually separate playback group (rewind, play, step, speed, Live/Replay toggle, timecode, timeline).
+    - The primary button follows this precedence:
+      1. The inspected run is active:
+         - starting → "Starting…" (disabled)
+         - running → "End experiment" (danger style; targets only the inspected run)
+      2. The inspected run is not active but any run is active (same or another experiment, including starting) → "Go to running experiment".
+      3. Nothing is active:
+         - no run → "Run experiment"
+         - completed or interrupted → "Run again" (current experiment settings plus current saved protocol revision; opens `#new-dialog`)
+         - failed → "View error" plus "Run again"
+    - The client maps lifecycle actions explicitly: start → running, stop → completed, failed → failed.
+    - The server emits `lifecycle {action:'failed'}` when startup fails, so the failure shows without waiting for the poll.
+    - Lifecycle events update `run.status` and the cached active run immediately.
+    - Stale `refreshRuns` responses (older request sequence) are discarded.
+    - A terminal status is never overwritten by a stale non-terminal one.
+  - Negative Tests:
+    - "End experiment" is enabled while the status is starting.
+    - Viewing a historical run while another run of the same experiment is active offers "Run again".
+    - A `failed` lifecycle event is shown as "Ended".
+
+- AC-8: Compact shell and visualization space budget. These are hard requirements with ±4px tolerance.
+  - Positive Tests (1440×900, experiment visualization view, simulation run):
+    - All chrome above the graph area (header row plus control strip) is ≤104px tall in total.
+    - The graph container height is ≥60% of the viewport height.
+    - The primary run button is fully visible without scrolling.
+  - Positive Tests (390×844):
+    - Page `scrollWidth` ≤ `innerWidth`.
+    - Graph container height ≥300px.
+    - The collapsed or closed bottom sheet occupies ≤56px.
+    - Interactive targets in the strip and sheet are ≥40px.
+  - Negative Tests:
+    - `.workspace-heading`, `.experiment-bar`, `.metrics` and the graph heading are still stacked as separate rows above the graph.
+    - Graph height is still derived from a hard-coded chrome estimate such as `calc(100vh - 480px)`.
+
+- AC-9: The sidebar auto-hides in the visualization view without losing navigation.
+  - Positive Tests:
+    - In the experiment visualization view the sidebar's rendered width is 0.
+    - A ☰ toggle in the header opens it as an overlay drawer containing My protocols, New protocol, Recent protocols and API docs.
+    - Library and protocol views still honour the saved `distvis-sidebar-collapsed` preference.
+    - Opening or closing the temporary drawer does not change that saved value.
+  - Negative Tests:
+    - Entering the visualization view writes to `distvis-sidebar-collapsed`.
+    - `#nav-guide` or the recent protocols cannot be reached from the visualization view.
+
+- AC-10: Topology geometry follows the container.
+  - Positive Tests:
+    - A ResizeObserver on the graph container recomputes the viewBox and node layout. Resize callbacks are coalesced with requestAnimationFrame.
+    - Layouts for 2, 5 and 12 nodes keep node cards at least 76×52 with label clearance.
+    - If 12 nodes cannot fit at the minimum size, the graph area scrolls internally while the page has no horizontal overflow.
+    - `graphStamp` includes the serialized selection, a live-revision counter and the geometry.
+  - Negative Tests:
+    - Node positions stay fixed at the 800×430 constants when the container changes size.
+    - A resize-render feedback loop occurs, where the observed size keeps changing.
+
+- AC-11: Unneeded information is removed.
+  - Positive Tests:
+    - The graph hint, graph legend, timeline caption and events footer move into one "Legend" disclosure.
+    - The duplicate experiment name and duplicate config summary are shown once each.
+    - The node subtitle ("teaching simulation node" / "Go · standalone container process") and the "view position" row are removed.
+    - Metrics are reduced to online nodes, messages and faults, shown inline.
+    - Overwrite semantics, disabled reasons, errors and live/replay markers stay as visible text.
+  - Negative Tests:
+    - Essential guidance (disabled reasons, overwrite notice, errors) exists only in `title` attributes.
+    - Replay time appears both in `#metric-time` and in `#timecode`.
+
+- AC-12: Mobile sheet and keyboard accessibility.
+  - Positive Tests:
+    - At ≤700px the popover is a bottom sheet with max-height 60vh and internal scroll. Default node selection does not open it; tapping a node, edge or badge opens it.
+    - Focus handling:
+      - Opening via the badge focuses the first input field.
+      - Other openings focus the popover heading.
+      - Closing restores focus to the originating element. If that element was redrawn, focus goes to the element with the same data identity; if it no longer exists, to the graph container.
+    - Escape precedence: modal dialog > drawer > link mode (returns to the node it was entered from) > popover/sheet close.
+    - Links are reachable by keyboard through the peer-link list.
+    - `.link-hit` has an accessible name but is not a mandatory Tab stop.
+  - Negative Tests:
+    - The sheet opens automatically when a run is opened.
+    - Escape closes the popover while a modal dialog is open.
+    - Focus is lost to `document.body` after the popover closes.
+
+- AC-13: Regression gate.
+  - Positive Tests:
+    - `npm run check`, `npm test` and `node tests/dom-smoke.mjs` all pass.
+    - These browser suites pass with updated selectors: `tests/browser-smoke.mjs`, `tests/browser-input-smoke.mjs`, `tests/browser-rpc-smoke.mjs`, `tests/browser-hierarchy-smoke.mjs`, `tests/browser-workspace-smoke.mjs`, `tests/browser-docs-smoke.mjs`.
+    - The new `tests/browser-layout-smoke.mjs` asserts AC-8, AC-9, AC-10 (12-node fallback), AC-1.1 and AC-12 (mobile Escape and focus).
+    - Behavioural assertions cover:
+      - asymmetric link preservation
+      - explicit two-direction overwrite
+      - replay/live isolation
+      - blocking by a same-experiment active run
+      - failed startup via the lifecycle event
+      - draft survival across live updates
+      - a delayed response after switching runs or targets
+    - An `npm run test:browser` script runs the browser suites.
+  - Negative Tests:
+    - Any existing smoke suite is deleted or skipped instead of updated.
+    - The layout test uses `fullPage` screenshots only, with no geometry assertions.
 
 ## Path Boundaries
 
-Path boundaries define the acceptable range of implementation quality and choices.
-
 ### Upper Bound (Maximum Acceptable Scope)
-<Affirmative description of the most comprehensive acceptable implementation>
-<This represents completing the goal without over-engineering>
-Example: "The implementation includes X, Y, and Z features with full test coverage"
+
+The implementation delivers everything in AC-1 to AC-13:
+- the anchored popover with node and link modes, a peer-link list and the space-time entry point
+- a live-state projection built on a shared pure reducer
+- target-keyed drafts, pending state and response guards
+- the run control strip with full state precedence and the server `lifecycle failed` event
+- the compact header with a temporary drawer sidebar
+- the ResizeObserver-driven topology with an internal-scroll fallback
+- information pruning
+- the mobile bottom sheet with defined focus and Escape behaviour
+- the new layout test plus updated smoke suites and an `npm run test:browser` script
 
 ### Lower Bound (Minimum Acceptable Scope)
-<Affirmative description of the minimum viable implementation>
-<This represents the least effort that still satisfies all acceptance criteria>
-Example: "The implementation includes core feature X with basic validation"
+
+The implementation still meets every AC, with the simplest mechanisms that do so:
+- popover positioning by bounding-rect math with side flip and clamp
+- a plain action `<select>` as the action chooser
+- a fixed-order drawer
+- metrics as one inline text line
+- the 12-node fallback done purely with CSS overflow on the graph area
 
 ### Allowed Choices
-<Options that are acceptable for implementation decisions>
-- Can use: <technologies, approaches, patterns that are allowed>
-- Cannot use: <technologies, approaches, patterns that are prohibited>
 
-> **Note on Deterministic Designs**: If the draft specifies a highly deterministic design with no choices (e.g., "must use JSON format", "must use algorithm X"), then the path boundaries should reflect this narrow constraint. In such cases, upper and lower bounds may converge to the same point, and "Allowed Choices" should explicitly state that the choice is fixed per the draft specification.
+- Can use:
+  - vanilla JS, HTML and CSS consistent with the existing framework-free frontend
+  - native `<dialog>` (non-modal `show()`) or a positioned `<div role="dialog">` for the popover
+  - the Popover API if the target browsers support it
+  - ResizeObserver and requestAnimationFrame
+  - the existing `api()`, `guard()`, `notify()`, `renderApplicationInput` form generator and `inputDrafts` pattern
+  - Playwright for browser tests, as existing suites do
+  - linkedom for DOM smoke
+- Cannot use:
+  - new runtime frontend dependencies or frameworks (the README states the frontend needs no third-party runtime packages)
+  - changes to the fault or command API payloads
+  - a docked right-hand inspector as the primary surface (user chose the anchored popover)
+  - per-node program or code configuration inside the popover
+  - forcing the user back to live mode before a mutation
 
 ## Feasibility Hints and Suggestions
 
 > **Note**: This section is for reference and understanding only. These are conceptual suggestions, not prescriptive requirements.
 
 ### Conceptual Approach
-<Text description, pseudocode, or diagrams showing ONE possible implementation path>
+
+```
+state:
+  selection = {kind:'node', id} | {kind:'link', a, b, dir, origin}
+  popoverOpen = bool
+  live = reduceAll(events)                 // shared pure reduceEvent(acc, e)
+  replay = snapshot() using the same reduceEvent up to cursor
+  liveRev++ on node / fault / input_schema events
+
+render():
+  if graphStamp(view, cursor, playTime, selection, liveRev, geometry) changed:
+     redraw SVG (innerHTML) including input badges from live.schemas
+  renderControlStrip(inspectedRun, activeRun)       // AC-7 precedence table
+  if popoverOpen:
+     renderPopover(selection)   // stable form DOM; rebuild only on selection/schema change
+     anchorPopover()            // getBoundingClientRect of [data-node=id] or .link-hit[data-from=a][data-to=b]
+                                // prefer right side, flip left, clamp to .graph-area; sheet mode at ≤700px
+
+mutation(targetKey, request):
+  token = {loadGen, runId, targetKey}; pending.set(targetKey)
+  try   await api(...)
+  catch keep draft; show inline error if token still current
+  finally clear pending[targetKey]; show notices only if token still current
+```
+
+Layout: `body` has the header row (breadcrumb/title, view switch, inline metrics, ☰) and the control strip (primary, status, "Network", playback group, timeline). Below them `.graph-area` fills the remaining height via flex or grid. There is no right column. The event log is a collapsible drawer below the graph.
 
 ### Relevant References
-<Code paths and concepts that might be useful>
-- <path/to/relevant/component> - <brief description>
+
+- `public/index.html`: current topbar, workspace heading, experiment bar, metrics, graph heading, `.inspector-tabs`, `#node-panel`, `#application-panel`, `#fault-panel`, `.transport`, `.timeline-wrap`, `#event-log`, sidebar.
+- `public/app.js`, grouped by area:
+  - **Event state:** `snapshot`/`resetCache` (replay reducer), `receiveEvent` (lifecycle mapping), `openRun` (default selection, load generation via `loadingRun`).
+  - **Graph drawing and selection:** `drawGraph`/`replaceGraph` (SVG string rendering, `.link-hit`, node card badge slot), `graphClick` and the keydown handler.
+  - **Inspector and faults:** `renderApplicationInput`/`nodeInputSchema`/`inputDrafts`, `renderInspector` (focus guard, `rawOpen`), `setTab`/`updateFaultFields`/`#inject-fault`.
+  - **Page chrome:** `render` (graphStamp, status and metrics writes), the playback handlers, `#stop-run`, `renderLibrary` (active-run banner, `#new-run`), `refreshRuns` (poll), `setSidebar`.
+  - **Space-time:** the ResizeObserver precedent.
+- `public/style.css`: sidebar/main layout and its override blocks, `.topbar` height, the graph height `clamp(... calc(100vh - 480px) ...)`, `.lab-grid` columns, mobile breakpoints.
+- `server/engine.js`: `validateFault` (kinds and ranges), `fault()` (per-direction link rules, heal clears links only), `stop()` lifecycle.
+- `server/index.js`: `launch()` catch (add the `lifecycle failed` event), the stop-during-starting rejection, the faults route with the `run.mutating` lock (409), the single-active-run check.
+- `server/inputs.js`: input schema limits (64 actions × 16 fields).
+- `tests/browser-smoke.mjs`, `tests/dom-smoke.mjs`: current fault-tab selectors to replace.
+- `tests/browser-input-smoke.mjs`, `tests/browser-rpc-smoke.mjs`, `tests/browser-hierarchy-smoke.mjs`, `tests/browser-workspace-smoke.mjs`, `tests/browser-docs-smoke.mjs`: selectors to keep working. Keep `#application-panel` and `#node-panel [data-field]` ids inside the popover.
+- `docs/UI-REVIEW.md`: prior compaction policy. It already requires that user-opened disclosures not collapse on refresh.
+- `README.md`: UI description and test instructions to update after implementation.
 
 ## Dependencies and Sequence
 
 ### Milestones
-1. <Milestone 1>: <Description>
-   - Phase A: <...>
-   - Phase B: <...>
-2. <Milestone 2>: <Description>
-   - Step 1: <...>
-   - Step 2: <...>
 
-<Describe relative dependencies between components, not time estimates>
+1. **State foundation.** Shared pure reducer, live projection, selection model, response-guard token.
+   - Phase A: extract `reduceEvent`; build the live projection hydrated in `openRun`, reset in `clearRun`, updated incrementally in `receiveEvent`; add `liveRev`.
+   - Phase B: explicit lifecycle mapping; server `lifecycle failed` event; request sequencing for `refreshRuns`; active-run cache.
+2. **Anchored popover.** Depends on Milestone 1.
+   - Phase A: popover container outside the SVG; node mode (input first, live toggle, peer-link list, replay state rows); anchoring, flip and clamp; close and switch behaviour; remove the tabs and the fault panel.
+   - Phase B: link mode with direction control, live prefill, overwrite notice and validation; edge and peer-list entry; space-time lane entry.
+   - Phase C: stable form DOM, target-keyed drafts and pending state, dirty-link reconciliation, schema-change draft reconciliation.
+3. **Run control strip.** Depends on Milestone 1, Phase B.
+   - Step 1: strip markup combining the primary action, status, "Network" control (heal and history), playback group and timeline.
+   - Step 2: precedence table between the inspected run and the active run; pending and error handling for stop.
+4. **Compact shell and geometry.** Depends on Milestone 3 for the final strip height.
+   - Step 1: merge the header rows; inline metrics; remove the right column; the graph area fills the remaining height.
+   - Step 2: temporary drawer sidebar in the visualization view; saved preference untouched elsewhere.
+   - Step 3: ResizeObserver topology with minimum sizes and internal-scroll fallback; geometry in `graphStamp`.
+5. **Pruning, badge, mobile, accessibility.** Depends on Milestones 2 and 4.
+   - Step 1: input badges on node cards; badge-to-first-field focus.
+   - Step 2: "Legend" disclosure; remove duplicates.
+   - Step 3: bottom-sheet mode ≤700px; focus entry and restore; Escape precedence; peer-list keyboard path.
+6. **Regression gate.** Selector updates land with each milestone; the new layout suite and behavioural assertions land last.
+
+Milestone 1 blocks everything that mutates. Milestones 2 and 3 can proceed in parallel after Milestone 1. Milestone 4 needs the final strip. Milestone 5 needs the popover and the final layout.
 
 ## Task Breakdown
 
@@ -74,34 +352,137 @@ Each task must include exactly one routing tag:
 
 | Task ID | Description | Target AC | Tag (`coding`/`analyze`) | Depends On |
 |---------|-------------|-----------|----------------------------|------------|
-| task1 | <...> | AC-1 | coding | - |
-| task2 | <...> | AC-2 | analyze | task1 |
+| task1 | Extract shared pure `reduceEvent`; build the live projection (hydrate, reset, incremental) and `liveRev`; switch replay `snapshot()` to the shared reducer | AC-4, AC-10 | coding | - |
+| task2 | Explicit lifecycle mapping on the client; server `lifecycle {action:'failed'}` in the `launch()` catch; `refreshRuns` request sequencing and terminal-status protection; active-run cache | AC-7 | coding | task1 |
+| task3 | Response-guard token `{loadGen, runId, targetKey}` and target-keyed pending registry used by all mutations | AC-6 | coding | task1 |
+| task4 | Popover container outside the SVG; node mode (input first, live crash/recover toggle, peer-link list, replay state rows, raw JSON); anchor, flip and clamp; open, switch and close; remove `.inspector-tabs` and `#fault-panel` | AC-1, AC-1.1, AC-4 | coding | task1, task3 |
+| task5 | Link mode: both-direction live rules, direction control and defaults, overwrite notice, integer range validation; edge, peer-list and space-time lane entry points | AC-1.2, AC-2 | coding | task4 |
+| task6 | Stable form DOM; drafts keyed per input action and link pair plus direction; dirty-link reconciliation; schema-change draft reconciliation; action chooser; visible disabled reasons | AC-5, AC-6 | coding | task4 |
+| task7 | Run control strip: primary button precedence table, status badge, "Network" control (heal with visible explanation, fault history), playback group and timeline; stop pending and error handling | AC-3, AC-7 | coding | task2, task3 |
+| task8 | Compact shell: merge header rows, inline metrics, remove the right column, graph area fills the remaining height; temporary drawer sidebar with ☰, saved preference untouched | AC-8, AC-9 | coding | task7 |
+| task9 | ResizeObserver topology geometry, minimum node size, internal-scroll fallback for 12 nodes, geometry in `graphStamp` | AC-10 | coding | task1, task8 |
+| task10 | Input badges on node cards from the live schema map; badge opens the popover and focuses the first field | AC-5 | coding | task4, task9 |
+| task11 | Information pruning: "Legend" disclosure, remove duplicate name/config, drop node subtitle and "view position" row, reduce metrics; keep essential guidance visible | AC-11 | coding | task8 |
+| task12 | Mobile bottom-sheet mode ≤700px, focus entry and restore with identity fallback, Escape precedence, peer-list keyboard path, accessible names on `.link-hit` | AC-12 | coding | task4, task8 |
+| task13 | Update the selectors and flows in the existing smoke suites (browser-smoke, dom-smoke, input, rpc, hierarchy, workspace, docs); add the `npm run test:browser` script | AC-13 | coding | task4, task7, task8 |
+| task14 | New `tests/browser-layout-smoke.mjs` with the geometry budgets, 12-node fallback, anchoring stability, mobile Escape/focus and behavioural assertions (asymmetric link, replay/live isolation, same-experiment block, failed lifecycle, draft survival, stale response) | AC-8, AC-9, AC-10, AC-12, AC-13 | coding | task9, task10, task11, task12, task13 |
+| task15 | Independent review of the finished UI against AC-1 to AC-13 and of the popover redraw and focus robustness; list gaps | AC-1 to AC-13 | analyze | task14 |
+| task16 | Update `README.md` and `docs/UI-REVIEW.md` to describe the new popover, control strip, drawer and test command | AC-13 | coding | task15 |
 
 ## Claude-Codex Deliberation
 
+### Codex First-Pass Findings (Codex Analysis v1)
+
+**Core risks:**
+- Replay-derived `cache.online` and `cache.links` could drive live mutations.
+- "Both" (both-direction) apply could silently destroy an asymmetric rule.
+- Run controls must distinguish the inspected run from the active run.
+- The draft's size estimate covered only the inspector change.
+
+**Missing requirements:**
+- selection lifecycle (default node-1, no deselection today)
+- global heal/history placement
+- non-graph link access (a peer list)
+- sidebar preference versus temporary auto-hide, and nav reachability (`.mobile-docs` is hidden above 760px)
+- bounded input growth (64 actions × 16 fields)
+- mobile presentation
+
+**Technical gaps:**
+- The current focus guard only covers `input` in `#node-panel`.
+- `tabindex` alone is insufficient for links.
+- `graphStamp` invalidation needs selection and schema data.
+- The client maps every non-start lifecycle action to completed.
+- The topology needs a geometry policy.
+- Mutations need pending and error handling.
+
 ### Agreements
-- <Point both sides agree on>
+
+- A selection-driven unified surface replaces the tabs, and the fault target comes from the selection.
+- Link editing is directional. Both rules are shown. "Both" requires an explicit overwrite notice.
+- Heal and fault history are reachable regardless of selection. Heal's meaning (links only, not crashed nodes) is visible text.
+- Mutations stay available during replay (documented README behaviour), provided the safeguards hold:
+  - live-derived state
+  - Live/Replay labels
+  - command results shown from live events regardless of the cursor
+- One pure reducer is shared by the live and replay projections. The live revision and the selection are part of `graphStamp`.
+- The sidebar is hidden temporarily in the visualization view without overwriting `distvis-sidebar-collapsed`.
+- Keyboard access to links goes through the peer list, so 66 edges are not all Tab stops.
+- The run control precedence uses the inspected run versus the active run, including same-experiment and starting runs.
+- Stop already awaits the API. What is missing is pending state, status handling and race protection.
+- "Run again" uses the current experiment settings plus the current saved protocol revision.
+- Guidance is not moved to tooltip-only. Disabled reasons, overwrite semantics and errors stay visible.
+- The test gate covers `npm run check`, `npm test`, DOM smoke and all browser suites including `browser-workspace-smoke`, plus behavioural assertions.
 
 ### Resolved Disagreements
-- <Topic>: Claude vs Codex summary, chosen resolution, and rationale
+
+- **Mutations during replay.** Codex v1 recommended requiring a return to live mode; Claude kept current behaviour with safeguards. Codex accepted in round 1 on condition that the safeguards become ACs (now AC-4). The user confirmed: allowed, labelled as acting on live.
+- **Active-run scope.** Codex said "another experiment active" was too narrow. Resolved by making any active run (same or other experiment, including starting) override rerun.
+- **Default link direction.** Codex said "direction clicked" is ambiguous for an undirected hit area. Resolved: graph edge → lower-index → higher-index; peer list → selected node → peer.
+- **Tooltip-only help.** Codex objected. Resolved: only decorative or tutorial prose folds into "Legend"; essential guidance stays visible.
+- **Response guards.** Rounds 2 and 3 required guarding by selection/action plus load generation, not only run id. Resolved: `{loadGen, runId, targetKey}` gates notices, inline renders, pending and drafts. This last refinement was adopted verbatim after round 3 without a further Codex pass.
+- **Status authority.** Resolved: lifecycle events update the active-run cache immediately; stale polls are discarded by request sequence; terminal statuses are never downgraded.
+- **Mobile lifecycle and focus.** Resolved:
+  - Default selection does not open the sheet.
+  - Badge-to-first-field focus takes precedence.
+  - Focus falls back by data identity, then to the graph container.
+  - Escape precedence is defined.
+- **Geometry fallback.** Resolved: minimum node card size, then internal graph-area scroll. Page-level horizontal overflow is prohibited; internal graph scroll is allowed.
+
+### Post-Convergence User Decision That Diverges From Both Reviewers
+
+- **Presentation form.** Claude and Codex both recommended a docked non-modal inspector on desktop plus a mobile sheet. The user chose a floating popover anchored beside the element. The plan adopts the user's choice and absorbs the risks Codex raised for this form:
+  - survives redraws (AC-1.1)
+  - must not cover its anchor
+  - defined focus and Escape handling (AC-12)
+  - peer-list access for dense graphs and the space-time view (AC-1.2)
+
+  This form was not re-reviewed by Codex. task15 schedules an independent Codex review of it after implementation.
 
 ### Convergence Status
-- Final Status: `converged` or `partially_converged`
+
+- Final Status: `partially_converged`. Three rounds ran (the maximum). After round 3, Codex listed one remaining required change, response notices gated by target key. Claude adopted it verbatim, but no fourth review confirmed it. The later user choice of the anchored popover also departs from the reviewed docked design. There are no open Claude/Codex disagreements.
 
 ## Pending User Decisions
 
-- DEC-1: <Decision topic>
-  - Claude Position: <...>
-  - Codex Position: <...>
-  - Tradeoff Summary: <...>
-  - Decision Status: `PENDING` or `<User's final decision>`
+- DEC-1: Mutations during replay
+  - Claude Position: allow them, with live-derived state and a "Live" marker
+  - Codex Position: initially required live mode; accepted Claude's position with safeguards in round 1
+  - Tradeoff Summary: convenience and consistency with README versus stricter protection against confusion
+  - Decision Status: `Allowed, labelled as acting on live — mutations allowed during replay, always act on the live run, clearly labelled`
+- DEC-2: Form of the unified dialog
+  - Claude Position: docked non-modal inspector on desktop plus a mobile bottom sheet
+  - Codex Position: same as Claude (docked is reasonable; a dialog is not established by the draft)
+  - Tradeoff Summary: a docked panel is lower risk and keeps the graph unobscured; an anchored popover keeps actions next to the element and frees the full graph width, but needs robust anchoring under per-frame redraws
+  - Decision Status: `Anchored floating popover beside the element; bottom sheet at ≤700px`
+- DEC-3: Scope of "node configuration"
+  - Claude Position: application input, node faults and link settings; code stays in the protocol workspace
+  - Codex Position: N/A - open question (asked to keep it explicitly provisional)
+  - Tradeoff Summary: including per-node program configuration would greatly expand scope and applies only to the next run
+  - Decision Status: `Application input + faults + link settings`
+- DEC-4: Numeric layout budgets
+  - Claude Position:
+    - 1440×900: chrome ≤104px, graph ≥60% of viewport height, sidebar width 0, primary button visible
+    - 390×844: no horizontal overflow, graph ≥300px, collapsed sheet ≤56px, targets ≥40px
+  - Codex Position: N/A - open question (asked for concrete defaults before implementation)
+  - Tradeoff Summary: hard thresholds make "simpler" testable but depend on font rendering
+  - Decision Status: `Hard requirements — hard acceptance criteria with ±4px rendering tolerance`
+- DEC-5: Sidebar policy in the visualization view
+  - Claude Position: temporary auto-hide; saved preference untouched
+  - Codex Position: agreed (round 1)
+  - Tradeoff Summary: reclaims width without surprising users in other views
+  - Decision Status: `Adopted per Claude/Codex agreement (not separately asked; consistent with draft "remove it or hide it automatically")`
 
 ## Implementation Notes
 
+### UI Copy Language
+- Labels in this plan are written as English glosses. The implemented UI keeps the application's existing Chinese copy style; implementers translate each gloss into matching Chinese UI text consistent with current strings in `public/app.js` and `public/index.html`.
+
 ### Code Style Requirements
-- Implementation code and comments must NOT contain plan-specific terminology such as "AC-", "Milestone", "Step", "Phase", or similar workflow markers
-- These terms are for plan documentation only, not for the resulting codebase
-- Use descriptive, domain-appropriate naming in code instead
+- Implementation code and comments must NOT contain plan-specific terminology such as "AC-", "Milestone", "Step", "Phase", or similar workflow markers.
+- These terms are for plan documentation only, not for the resulting codebase.
+- Use descriptive, domain-appropriate naming in code instead.
+- Match the existing style of `public/app.js`: compact vanilla JS, `$`/`$$` helpers, `guard()` for async handlers, Chinese UI strings, sparse comments that explain intent.
+- Keep existing element ids used by tests (`#application-panel`, `#node-panel [data-field]`, `#run-status`, `#metric-messages`, `#play`, `#step`, `#go-live`, `#speed`, `#timeline`, `#nav-guide`) or update every referencing test in the same change.
 
 ## Output File Convention
 
