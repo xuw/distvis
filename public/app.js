@@ -415,10 +415,6 @@ function nodeInputSchema(node = selected) { return liveState?.schemas[node] || [
 function inputDraftKey(node = selected) { return `${run?.id}:${node}`; }
 function liveOnline(node = selected) { return liveState?.online[node] !== false; }
 function pairKey(a, b) { return `${a}>${b}`; }
-function currentTargetKey() {
-  if (!run) return '';
-  return linkSel ? `${run.id}:link:${pairKey(linkSel.a, linkSel.b)}` : `${run.id}:node:${selected}`;
-}
 function chosenAction(node = selected) {
   const schema = nodeInputSchema(node), chosen = inputActions.get(inputDraftKey(node));
   return schema.some(s => s.action === chosen) ? chosen : schema[0]?.action;
