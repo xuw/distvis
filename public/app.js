@@ -38,7 +38,7 @@ let cache, cacheCursor = -1, renderDirty = true, latestTime = 0, lastFrame = 0, 
 let linkSel = null, popoverOpen = false, popoverOrigin = null, popoverError = null;
 // Controls act on the running experiment, so they read this projection of every received event,
 // never the replay snapshot, which stops at the playback cursor.
-let liveState, liveRev = 0, refreshSeq = 0, refreshApplied = 0, drawerOpen = false;
+let liveState, schemaRev = 0, anchorDirty = true, refreshSeq = 0, refreshApplied = 0, drawerOpen = false;
 let graphBox = { width: 0, height: 0 };
 const pending = new Set(), linkDrafts = new Map(), inputActions = new Map();
 // Busy state belongs to the run that sent the request: a slow reply from an earlier run never
@@ -46,7 +46,6 @@ const pending = new Set(), linkDrafts = new Map(), inputActions = new Map();
 const faultsInFlight = new Map(), stopsInFlight = new Set();
 function faultBusy(runId = run?.id) { return (faultsInFlight.get(runId) || 0) > 0; }
 function stopPending(runId = run?.id) { return stopsInFlight.has(runId); }
-const terminalStatuses = new Set(['completed', 'failed', 'interrupted']);
 // A run only moves forward through these; an older snapshot never moves it back.
 const statusRank = { created: 0, starting: 1, running: 2, completed: 3, failed: 3, interrupted: 3 };
 let graphView = 'topology', spaceWindow = 1000, graphStamp = '';
@@ -131,33 +130,35 @@ function snapshot() {
   cacheCursor = cursor;
   return cache;
 }
-function hydrateLive() { liveState = emptyState(); for (const e of events) reduceEvent(liveState, e); liveRev++; }
+function hydrateLive() { liveState = emptyState(); for (const e of events) reduceEvent(liveState, e); schemaRev++; }
 // The furthest status seen for each run, from any source (events, loads, stop replies, polls).
 // It outlives navigation, so a poll that started before a run ended cannot revive it later.
 const knownStatus = new Map();
 function noteStatus(runId, status) {
   if (!runId || !(status in statusRank)) return knownStatus.get(runId);
   const known = knownStatus.get(runId);
-  // The first terminal status wins; later reports cannot relabel a failed run as completed.
-  if (!known || statusRank[status] > statusRank[known] || (statusRank[status] === statusRank[known] && !terminalStatuses.has(known))) knownStatus.set(runId, status);
+  // Only a strictly later stage replaces the known one, so the first terminal status wins.
+  if (!known || statusRank[status] > statusRank[known]) knownStatus.set(runId, status);
   return knownStatus.get(runId);
 }
-function markActiveStatus(runId, status) {
+// Every status source goes through here: the store, the inspected run and the active-run cache agree.
+function setRunStatus(runId, status) {
   const best = noteStatus(runId, status);
+  if (run?.id === runId) run.status = best;
   for (const item of experiments) if (item.latestRun?.id === runId) item.latestRun.status = best;
+  return best;
 }
-const liveChanges = new Set(['node', 'fault', 'input_schema', 'command_result', 'command_error', 'lifecycle']);
 function receiveEvent(e) {
   if (events.length && e.seq <= events.at(-1).seq) return;
   events.push(e); latestTime = Math.max(latestTime, e.time);
   if (e.type === 'receive' || e.type === 'drop') ends.set(e.id, e);
   if (e.type === 'send') sends.set(e.id, e);
   if (liveState) reduceEvent(liveState, e);
-  if (liveChanges.has(e.type)) liveRev++;
+  if (e.type === 'input_schema') schemaRev++;
   if (e.type === 'lifecycle' && run) {
     const next = { start: 'running', stop: 'completed', failed: 'failed' }[e.action];
     // Statuses only move forward, so a late start never revives a run that has already ended.
-    if (next) { noteStatus(run.id, run.status); markActiveStatus(run.id, next); run.status = knownStatus.get(run.id); }
+    if (next) { setRunStatus(run.id, run.status); setRunStatus(run.id, next); }
   }
   if (live) { cursor = events.length; playTime = latestTime; }
   renderDirty = true;
@@ -168,7 +169,7 @@ async function openRun(id, asLive = false) {
   if (requestId !== loadingRun || result.config.experimentId !== experiment?.id) return;
   stream?.close();
   run = result; events = result.events; delete run.events;
-  run.status = noteStatus(run.id, run.status);
+  setRunStatus(run.id, run.status);
   ends.clear();
   sends.clear();
   for (const e of events) {
@@ -178,7 +179,7 @@ async function openRun(id, asLive = false) {
   selected = 'node-1'; live = asLive; playing = false; latestTime = Math.max(result.time, events.at(-1)?.time || 0);
   cursor = asLive ? events.length : 0; playTime = asLive ? latestTime : 0;
   spaceStart = 0; spaceFollow = true; spaceNode = 'all';
-  linkSel = null; popoverOpen = false; popoverError = null;
+  resetPopover();
   resetCache(); hydrateLive(); populateNodes(); renderDirty = true; graphStamp = '';
   localStorage.setItem(`distvis-run:${experiment.id}`, id);
   stream = new EventSource(`/api/runs/${id}/events?after=${events.at(-1)?.seq || 0}`);
@@ -225,7 +226,7 @@ function drawGraph(state) {
   for (let i = 0; i < count; i++) for (let j = i + 1; j < count; j++) {
     const from = list[i], to = list[j], a = positions[from], b = positions[to];
     const forward = state.links[`${from}>${to}`], reverse = state.links[`${to}>${from}`];
-    const blocked = forward?.blocked || reverse?.blocked, chosen = popoverOpen && linkSel?.a === from && linkSel?.b === to;
+    const blocked = forward?.blocked || reverse?.blocked, chosen = linkSel?.a === from && linkSel?.b === to;
     const summary = `${from} → ${to}：${ruleText(forward)}；${to} → ${from}：${ruleText(reverse)}`;
     parts.push(`<path class="link-line ${blocked ? 'blocked' : ''} ${chosen ? 'selected' : ''}" d="M${a.x} ${a.y}L${b.x} ${b.y}"/><path class="link-hit" data-from="${from}" data-to="${to}" role="button" tabindex="-1" aria-label="${esc(`${from} 与 ${to} 之间的链路。${summary}`)}" d="M${a.x} ${a.y}L${b.x} ${b.y}"><title>${esc(summary)}\n点击配置链路</title></path>`);
   }
@@ -462,7 +463,7 @@ function draftValue(field, entry) {
   if (field.type === 'select' && saved !== '' && !field.options.includes(saved)) return '';
   return saved;
 }
-function applicationForm(s, values, chosen) {
+function applicationForm(s, values) {
   const controls = s.fields.map(f => {
     const name = esc(f.name), saved = draftValue(f, values[f.name]);
     const required = f.required ? 'required' : '';
@@ -473,13 +474,13 @@ function applicationForm(s, values, chosen) {
     else control = `<input name="${name}" type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(saved)}" ${required} ${f.type === 'number' ? `step="${f.integer ? '1' : 'any'}"` : `maxlength="${f.maxLength || 8192}"`} ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}>`;
     return `<label class="${f.type === 'boolean' ? 'checkbox' : 'field'}">${esc(f.label)}${control}</label>`;
   }).join('');
-  return `<form class="application-form" data-action="${esc(s.action)}" ${s.action === chosen ? '' : 'hidden'}><h4>${esc(s.label)}</h4>${s.description ? `<p class="form-help">${esc(s.description)}</p>` : ''}${controls}<button type="submit" class="button primary">发送至 ${esc(selected)}</button></form>`;
+  return `<form class="application-form" data-action="${esc(s.action)}"><h4>${esc(s.label)}</h4>${s.description ? `<p class="form-help">${esc(s.description)}</p>` : ''}${controls}<button type="submit" class="button primary">发送至 ${esc(selected)}</button></form>`;
 }
 function renderApplicationInput() {
   const panel = $('#application-panel'), node = selected, schema = nodeInputSchema(node), key = inputDraftKey(node);
   const chosen = chosenAction(node);
   // Forms are rebuilt only when the node or its declared schema changes, so typing survives live updates.
-  const stamp = `${key}:${JSON.stringify(schema)}`;
+  const stamp = `${key}:${schemaRev}`;
   // An IME composition in progress would be destroyed by a rebuild; wait until it ends.
   if (panel.dataset.stamp !== stamp && !composingInput) {
     const active = panel.contains(document.activeElement) ? document.activeElement : null;
@@ -487,7 +488,7 @@ function renderApplicationInput() {
     panel.dataset.stamp = stamp;
     const draft = inputDrafts.get(key) || {};
     const chooser = schema.length > 1 ? `<label class="field action-choice">操作<select id="input-action" aria-label="选择应用输入操作">${schema.map(s => `<option value="${esc(s.action)}">${esc(s.label)}</option>`).join('')}</select></label>` : '';
-    panel.innerHTML = '<div class="inspector-section-title">应用输入 <span class="live-tag">实时</span></div>' + (schema.length ? chooser + schema.map(s => applicationForm(s, draft[s.action] || {}, chosen)).join('') : '<p class="form-help">此节点尚未声明应用输入接口。</p>') + '<p id="application-note" class="form-help"></p><div id="application-result"></div>';
+    panel.innerHTML = '<div class="inspector-section-title">应用输入 <span class="live-tag">实时</span></div>' + (schema.length ? chooser + schema.map(s => applicationForm(s, draft[s.action] || {})).join('') : '<p class="form-help">此节点尚未声明应用输入接口。</p>') + '<p id="application-note" class="form-help"></p><div id="application-result"></div>';
     if (focus?.id === 'input-action') $('#input-action')?.focus();
     else if (focus?.name) {
       const form = [...panel.querySelectorAll('form')].find(f => f.dataset.action === focus.action);
@@ -580,7 +581,6 @@ function renderNodePopover(state) {
 }
 function linkRule(from, to) { return liveState.links[pairKey(from, to)]; }
 function linkEnds() { return linkSel.dir === 'ba' ? [linkSel.b, linkSel.a] : [linkSel.a, linkSel.b]; }
-function linkDraftKey() { return `${run.id}:${pairKey(linkSel.a, linkSel.b)}:${linkSel.dir}`; }
 // A two-way edit overwrites both directions, so a change to either one must be noticed.
 function linkBase() {
   const { a, b, dir } = linkSel;
@@ -603,7 +603,7 @@ function renderLinkPopover() {
   $('#dir-ab').textContent = `${a} → ${b}`; $('#dir-ba').textContent = `${b} → ${a}`;
   $$('.direction-choice button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.dir === dir)));
   // A dirty draft is never overwritten by live updates; the user decides whether to take the new rule.
-  const key = linkDraftKey(), base = linkBase(), draft = linkDrafts.get(key), form = $('#link-form');
+  const key = linkOperation(), base = linkBase(), draft = linkDrafts.get(key), form = $('#link-form');
   if (draft) { if (form.dataset.key !== key) fillLinkForm(draft); }
   else if (form.dataset.key !== key || form.dataset.base !== base) fillLinkForm(liveLinkValues());
   form.dataset.key = key; form.dataset.base = base;
@@ -623,7 +623,9 @@ function renderPopover(state) {
   $('#popover-error').hidden = !error; $('#popover-error').textContent = error;
   if (linkSel) renderLinkPopover(); else renderNodePopover(state);
 }
-function sheetMode() { return typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches; }
+const phoneQuery = typeof matchMedia === 'function' ? matchMedia('(max-width: 700px)') : null;
+phoneQuery?.addEventListener?.('change', () => { anchorDirty = true; });
+function sheetMode() { return !!phoneQuery?.matches; }
 function popoverAnchor() {
   if (linkSel?.origin.kind === 'graph' && graphView !== 'spacetime') return $(`#graph [data-from="${linkSel.a}"][data-to="${linkSel.b}"]`);
   return $(`${graphView === 'spacetime' ? '#spacetime' : '#graph'} [data-node="${linkSel ? linkSel.origin.node : selected}"]`);
@@ -660,11 +662,13 @@ function anchorPopover() {
   }
   pop.style.left = `${Math.round(left - hostBox.left)}px`; pop.style.top = `${Math.round(top - hostBox.top)}px`;
 }
+function resetPopover() { linkSel = null; popoverOpen = false; popoverError = null; }
+function backToOriginNode() { openNodePopover(linkSel.origin.node, `[data-node="${linkSel.origin.node}"]`); }
 function nodeIndex(node) { return Number(node.split('-')[1]); }
 function openNodePopover(node, origin, focusInput = false) {
   selected = node; linkSel = null; popoverOpen = true; popoverError = null;
   if (origin) popoverOrigin = origin;
-  graphStamp = ''; renderDirty = true; render();
+  renderDirty = true; render();
   const form = [...$('#application-panel').querySelectorAll('form')].find(f => !f.hidden);
   const field = focusInput && form?.querySelector('input, select, textarea');
   (field || $('#popover-title')).focus?.();
@@ -673,13 +677,13 @@ function openLinkPopover(from, to, origin) {
   const [a, b] = nodeIndex(from) < nodeIndex(to) ? [from, to] : [to, from];
   linkSel = { a, b, dir: from === a ? 'ab' : 'ba', origin: { kind: origin, node: origin === 'graph' ? a : selected } };
   popoverOpen = true; popoverError = null;
-  graphStamp = ''; renderDirty = true; render();
+  renderDirty = true; render();
   $('#popover-title').focus?.();
 }
 function closePopover() {
   if (!popoverOpen) return;
-  popoverOpen = false; linkSel = null; popoverError = null;
-  graphStamp = ''; renderDirty = true; render();
+  resetPopover();
+  renderDirty = true; render();
   // Return focus to where the popover was opened; a redraw may have replaced that element.
   const view = graphView === 'spacetime' ? '#spacetime' : '#graph';
   const origin = (popoverOrigin && $(`${view} ${popoverOrigin}`)) || $(`${view} [data-node="${selected}"]`);
@@ -727,14 +731,16 @@ function selectionStamp() {
 function render() {
   const state = snapshot();
   $('#empty-graph').hidden = Boolean(run);
-  const stamp = `${run?.id}:${graphView}:${cursor}:${playTime}:${selected}:${selectionStamp()}:${liveRev}:${graphBox.width}x${graphBox.height}:${spaceWindow}:${spaceStart}:${spaceFollow}:${spaceNode}:${hideHeartbeats}`;
+  const stamp = `${run?.id}:${graphView}:${cursor}:${playTime}:${selected}:${selectionStamp()}:${schemaRev}:${graphBox.width}x${graphBox.height}:${spaceWindow}:${spaceStart}:${spaceFollow}:${spaceNode}:${hideHeartbeats}`;
   if (stamp !== graphStamp) {
     graphStamp = stamp;
     if (graphView === 'spacetime') drawSpaceTime(state);
     else drawGraph(state);
+    anchorDirty = true;
   }
-  if (renderDirty) { renderDirty = false; renderPanels(state); }
-  anchorPopover();
+  if (renderDirty) { renderDirty = false; renderPanels(state); anchorDirty = true; }
+  // Re-anchoring reads layout, so it runs only after something could have moved the popover.
+  if (anchorDirty) { anchorDirty = false; anchorPopover(); }
 }
 function renderPanels(state) {
   if (run) {
@@ -766,7 +772,11 @@ function renderPanels(state) {
   $('#play').innerHTML = icon(live || playing ? 'pause' : 'play');
   // Heal and the fault history act on and describe the live run, whatever the popover shows.
   $('#heal-links').disabled = !run || !!faultBlockReason() || pending.has(`${run.id}:heal`);
-  $('#fault-history').innerHTML = run ? liveState.faults.slice(-6).reverse().map(e => `<div class="fault-item"><span>${esc(faultText(e.fault))}</span><span>${time(e.time)}</span></div>`).join('') || '暂无故障' : '暂无故障';
+  const faultStamp = run ? `${run.id}:${liveState.faults.length}` : '';
+  if ($('#fault-history').dataset.stamp !== faultStamp) {
+    $('#fault-history').dataset.stamp = faultStamp;
+    $('#fault-history').innerHTML = run ? liveState.faults.slice(-6).reverse().map(e => `<div class="fault-item"><span>${esc(faultText(e.fault))}</span><span>${time(e.time)}</span></div>`).join('') || '暂无故障' : '暂无故障';
+  }
   if (run) renderPopover(state); else $('#element-popover').hidden = true;
   renderEvents();
 }
@@ -802,10 +812,10 @@ function eventDetail(seq, { locate = true } = {}) {
 }
 function graphClick(e) {
   const badge = e.target.closest('[data-input-node]'), node = e.target.closest('[data-node]'), link = e.target.closest('[data-from]'), event = e.target.closest('[data-event]');
-  if (badge) openNodePopover(badge.dataset.inputNode, `[data-input-node="${badge.dataset.inputNode}"]`, true);
-  else if (node) openNodePopover(node.dataset.node, `[data-node="${node.dataset.node}"]`);
+  if (badge) openNodePopover(badge.dataset.inputNode, elementSelector(badge), true);
+  else if (node) openNodePopover(node.dataset.node, elementSelector(node));
   else if (event) eventDetail(event.dataset.event, { locate: false });
-  else if (link) { popoverOrigin = `[data-from="${link.dataset.from}"][data-to="${link.dataset.to}"]`; openLinkPopover(link.dataset.from, link.dataset.to, 'graph'); }
+  else if (link) { popoverOrigin = elementSelector(link); openLinkPopover(link.dataset.from, link.dataset.to, 'graph'); }
   else if (popoverOpen) closePopover();
 }
 for (const svg of [$('#graph'), $('#spacetime')]) {
@@ -886,7 +896,8 @@ if (typeof ResizeObserver !== 'undefined') {
 }
 $('#event-rows').onclick = e => { const row = e.target.closest('[data-event]'); if (row) eventDetail(row.dataset.event); };
 $('#popover-close').onclick = closePopover;
-$('#popover-back').onclick = () => { if (linkSel) openNodePopover(linkSel.origin.node, `[data-node="${linkSel.origin.node}"]`); };
+for (const scroller of ['.graph-area', '.spacetime-scroll']) $(scroller).addEventListener('scroll', () => { anchorDirty = true; }, { passive: true });
+$('#popover-back').onclick = () => { if (linkSel) backToOriginNode(); };
 $('#node-toggle').onclick = guard(async () => {
   if (!run || linkSel) return;
   const node = selected, action = $('#node-toggle').dataset.nodeAction;
@@ -901,17 +912,17 @@ $('.direction-choice').onclick = e => {
 function saveLinkDraft() {
   if (!linkSel || !run) return;
   // The baseline is the live rule when editing began, so a later live change is still reported.
-  const key = linkDraftKey(), base = linkDrafts.get(key)?.base ?? $('#link-form').dataset.base;
+  const key = linkOperation(), base = linkDrafts.get(key)?.base ?? $('#link-form').dataset.base;
   linkDrafts.set(key, { latency: $('#link-latency').value, bandwidth: $('#link-bandwidth').value, blocked: $('#link-blocked').checked, base });
   renderDirty = true;
 }
 $('#link-form').addEventListener('input', saveLinkDraft);
 $('#link-form').addEventListener('change', saveLinkDraft);
-$('#link-use-latest').onclick = () => { if (!linkSel) return; linkDrafts.delete(linkDraftKey()); $('#link-form').dataset.key = ''; renderDirty = true; render(); };
+$('#link-use-latest').onclick = () => { if (!linkSel) return; linkDrafts.delete(linkOperation()); $('#link-form').dataset.key = ''; renderDirty = true; render(); };
 $('#link-form').addEventListener('submit', guard(async e => {
   e.preventDefault();
   if (!linkSel || !run) return;
-  const { a, b, dir } = linkSel, [from, to] = linkEnds(), key = linkDraftKey(), submitted = linkDrafts.get(key);
+  const { dir } = linkSel, [from, to] = linkEnds(), key = linkOperation(), submitted = linkDrafts.get(key);
   const latency = String($('#link-latency').value).trim(), bandwidth = String($('#link-bandwidth').value).trim();
   const valid = (text, min, max) => /^\d+$/.test(text) && Number(text) >= min && Number(text) <= max;
   if (!valid(latency, 0, 30000) || !valid(bandwidth, 1, 100000)) {
@@ -955,8 +966,8 @@ $('#stop-run').onclick = guard(async () => {
   stopsInFlight.add(token.runId); renderDirty = true; render();
   try {
     const info = await api(`/api/runs/${token.runId}/stop`, {});
-    markActiveStatus(token.runId, info.status);
-    if (isCurrent(token)) { run.status = knownStatus.get(run.id); notify('实验已结束，完整记录已保存'); }
+    setRunStatus(token.runId, info.status);
+    if (isCurrent(token)) notify('实验已结束，完整记录已保存');
     await refreshRuns();
   } catch (error) {
     // A failure for a run the user has already left is not reported on the page they are now on.
@@ -1017,14 +1028,14 @@ async function refreshRuns() {
   if(id!==experiment?.id)return;
   for(const item of history)item.status=noteStatus(item.id,item.status);
   runs=history;$('#history-count').textContent=scopedRuns().length;
-  if(run){const current=runs.find(r=>r.id===run.id);if(current){run.status=noteStatus(run.id,current.status);markActiveStatus(run.id,run.status);latestTime=Math.max(latestTime,current.time);renderDirty=true;}}
+  if(run){const current=runs.find(r=>r.id===run.id);if(current){setRunStatus(run.id,current.status);latestTime=Math.max(latestTime,current.time);renderDirty=true;}}
   if(workspaceView==='history')renderHistory();
 }
 function clearRun() {
   $('#run-details').open=false;
   ++loadingRun;stream?.close();stream=null;run=null;events=[];ends.clear();sends.clear();
   live=false;playing=false;cursor=0;playTime=0;latestTime=0;graphStamp='';resetCache();liveState=null;populateNodes();
-  linkSel=null;popoverOpen=false;popoverError=null;$('#element-popover').hidden=true;
+  resetPopover();$('#element-popover').hidden=true;
   for(const id of ['#node-panel','#application-panel','#peer-links','#link-rules']){$(id).innerHTML='';delete $(id).dataset.stamp;}
   $('#link-form').dataset.key='';
   $('#fault-history').textContent='暂无故障';
@@ -1396,7 +1407,7 @@ document.addEventListener('keydown',e=>{
   if(menus.length){menus.forEach(menu=>{menu.open=false;});return;}
   if(drawerOpen){setDrawer(false);$('#toggle-sidebar').focus();return;}
   if(!popoverOpen)return;
-  if(linkSel)openNodePopover(linkSel.origin.node,`[data-node="${linkSel.origin.node}"]`);else closePopover();
+  if(linkSel)backToOriginNode();else closePopover();
 });
 async function init() {
   await refreshProtocols();await migrateBrowserDraft();await refreshRuns();

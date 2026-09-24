@@ -142,7 +142,7 @@ await vm.runInContext('pendingHeal',context);await delay();await sync();
 assert.equal(document.querySelector('#toast').textContent,'','no notice for a run the user left');
 assert.equal(vm.runInContext('pending.size + faultsInFlight.size',context),0,'pending state is released');
 // A late failure for one input action must not appear after the user switched to another action.
-vm.runInContext("savedSchemas=liveState.schemas['node-1'];liveState.schemas['node-1']=[{action:'first',label:'First',fields:[]},{action:'second',label:'Second',fields:[]}];liveRev++;openNodePopover('node-1');",context);
+vm.runInContext("savedSchemas=liveState.schemas['node-1'];liveState.schemas['node-1']=[{action:'first',label:'First',fields:[]},{action:'second',label:'Second',fields:[]}];schemaRev++;openNodePopover('node-1');",context);
 document.querySelector('#toast').textContent='';hold.post=true;
 document.querySelector('#application-panel form[data-action="first"]').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
 await delay();hold.post=false;
@@ -152,7 +152,7 @@ assert.equal(document.querySelector('#popover-error').hidden,true,'no stale erro
 assert.equal(document.querySelector('#toast').textContent,'','no stale notice for the action the user left');
 vm.runInContext("inputActions.set(inputDraftKey('node-1'),'first');renderDirty=true;render();",context);
 assert.equal(document.querySelector('#popover-error').hidden,true);
-vm.runInContext("liveState.schemas['node-1']=savedSchemas;liveRev++;renderDirty=true;render();",context);
+vm.runInContext("liveState.schemas['node-1']=savedSchemas;schemaRev++;renderDirty=true;render();",context);
 // Same for a link direction: a late failure for node-1 → node-2 stays silent once node-2 → node-1 is shown.
 await click('#peer-links [data-peer="node-2"]');
 hold.post=true;document.querySelector('#link-form').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
@@ -175,7 +175,7 @@ await click('#link-use-latest');
 // A two-way draft watches both directions: a change to the reverse rule alone is reported.
 await click('#dir-both');
 document.querySelector('#link-latency').value='555';document.querySelector('#link-latency').dispatchEvent(new window.Event('input',{bubbles:true}));
-vm.runInContext("liveState.links['node-2>node-1']={latency:99,bandwidth:5,blocked:false};liveRev++;renderDirty=true;render();",context);
+vm.runInContext("liveState.links['node-2>node-1']={latency:99,bandwidth:5,blocked:false};schemaRev++;renderDirty=true;render();",context);
 assert.equal(document.querySelector('#link-changed').hidden,false,'reverse-only change is noticed');
 document.querySelector('#link-latency').value='556';document.querySelector('#link-latency').dispatchEvent(new window.Event('input',{bubbles:true}));paint();
 assert.equal(document.querySelector('#link-latency').value,'556');
@@ -190,7 +190,7 @@ await click('#dir-ba');const baStamp=stampNow();
 await click('#dir-both');const bothStamp=stampNow();
 assert.equal(new Set([abStamp,baStamp,bothStamp]).size,3,'each link direction is a distinct selection');
 assert.match(bothStamp,/"dir":"both"/);
-vm.runInContext("delete liveState.links['node-2>node-1'];liveRev++;closePopover();",context);
+vm.runInContext("delete liveState.links['node-2>node-1'];schemaRev++;closePopover();",context);
 assert.match(stampNow(),/:null:/,'a closed popover is part of the stamp');
 // A stop request that fails after the user left the run stays silent.
 document.querySelector('#toast').textContent='';
