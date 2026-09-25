@@ -288,6 +288,7 @@ export const server = http.createServer(async (req, res) => {
         }
         if (action === 'commands') {
           const input = await body(req);
+          if (input.batch !== undefined) return json(res, 200, { ok: true, ...run.commandBatch(input.batch) });
           const result = run.command(input.node, input.key, input.value, input.action, input.values);
           return json(res, 200, { ok: true, ...result });
         }

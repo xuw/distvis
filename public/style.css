@@ -216,3 +216,4 @@ body.visual-mode .workspace-heading,body.visual-mode #running-elsewhere{display:
   .run-strip .more-menu{position:static}
   .run-strip .menu-content,#network-menu .menu-content{left:8px;right:8px;top:100%;width:auto;min-width:0;max-width:none}
 }
+.concurrent-targets{border:1px solid #e6ecef;border-radius:7px;padding:9px 11px 0;margin:2px 0 14px}.concurrent-targets legend{font-size:10px;color:#75828e;padding:0 4px}.concurrent-list{display:flex;flex-wrap:wrap;gap:4px 14px}.concurrent-list .checkbox{margin-bottom:6px}.concurrent-targets .form-help{margin:2px 0 8px;font-size:10px;line-height:1.6}

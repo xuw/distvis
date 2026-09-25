@@ -22,7 +22,7 @@ function validateProjects(projects) {
 }
 function settings(input = {}, protocol) {
   const config=validateConfig({...input,protocol:['raft','token','gossip'].includes(protocol)?protocol:'custom'});
-  return Object.fromEntries(['runtime','nodeCount','seed','latency','bandwidth'].map(k=>[k,config[k]]));
+  return Object.fromEntries(['runtime','nodeCount','seed','latency','bandwidth','delayModel','jitter'].map(k=>[k,config[k]]));
 }
 function legacySource(source) {
   return {entry:'.',files:[

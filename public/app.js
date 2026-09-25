@@ -116,7 +116,7 @@ function reduceEvent(acc, e) {
     const f = e.fault; acc.faults.push(e);
     if (f.kind === 'heal') acc.links = {};
     if (f.kind === 'link') {
-      const rule = { latency: f.latency, bandwidth: f.bandwidth, blocked: f.blocked };
+      const rule = { latency: f.latency, bandwidth: f.bandwidth, blocked: f.blocked, ...(f.delayModel ? { delayModel: f.delayModel, jitter: f.delayModel === 'fixed' ? 0 : f.jitter } : {}) };
       acc.links[`${f.from}>${f.to}`] = rule;
       if (f.bidirectional) acc.links[`${f.to}>${f.from}`] = rule;
     }
@@ -191,9 +191,10 @@ async function openRun(id, asLive = false) {
 function populateNodes() {
   $('#spacetime-node').innerHTML = '<option value="all">全部节点</option>' + nodes().map(n => `<option>${n}</option>`).join('');
 }
-function ruleText(rule) { return !rule ? '默认' : rule.blocked ? '中断' : `${rule.latency} ms · ${rule.bandwidth} KiB/s`; }
+function jitterText(model, jitter) { return model === 'exponential' ? ` + Exp(${jitter})` : ''; }
+function ruleText(rule) { return !rule ? '默认' : rule.blocked ? '中断' : `${rule.latency}${jitterText(rule.delayModel, rule.jitter)} ms · ${rule.bandwidth} KiB/s`; }
 function faultText(f) {
-  return { crash: `${f.node} 崩溃`, recover: `${f.node} 恢复`, heal: '恢复全部链路', link: `${f.from} ${f.bidirectional ? '↔' : '→'} ${f.to} · ${f.blocked ? '中断' : `${f.latency}ms / ${f.bandwidth} KiB/s`}` }[f.kind];
+  return { crash: `${f.node} 崩溃`, recover: `${f.node} 恢复`, heal: '恢复全部链路', link: `${f.from} ${f.bidirectional ? '↔' : '→'} ${f.to} · ${f.blocked ? '中断' : `${f.latency}${jitterText(f.delayModel, f.jitter)}ms / ${f.bandwidth} KiB/s`}` }[f.kind];
 }
 function eventContent(e) {
   if (e.type === 'command_result') return `${e.commandId} ${e.error || JSON.stringify(e.result)}`;
@@ -412,6 +413,10 @@ function switchView(view) {
   graphStamp = ''; renderDirty = true; render();
 }
 const inputDrafts = new Map();
+// Nodes chosen to receive the same input at the same instant, per run and source node.
+const concurrentPicks = new Map();
+// A peer can join a concurrent send if it is online and declares an input with the same label.
+function peerAction(peer, label) { return liveOnline(peer) ? nodeInputSchema(peer).find(s => s.label === label)?.action : undefined; }
 function nodeInputSchema(node = selected) { return liveState?.schemas[node] || []; }
 function inputDraftKey(node = selected) { return `${run?.id}:${node}`; }
 function liveOnline(node = selected) { return liveState?.online[node] !== false; }
@@ -474,7 +479,9 @@ function applicationForm(s, values) {
     else control = `<input name="${name}" type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(saved)}" ${required} ${f.type === 'number' ? `step="${f.integer ? '1' : 'any'}"` : `maxlength="${f.maxLength || 8192}"`} ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}>`;
     return `<label class="${f.type === 'boolean' ? 'checkbox' : 'field'}">${esc(f.label)}${control}</label>`;
   }).join('');
-  return `<form class="application-form" data-action="${esc(s.action)}"><h4>${esc(s.label)}</h4>${s.description ? `<p class="form-help">${esc(s.description)}</p>` : ''}${controls}<button type="submit" class="button primary">发送至 ${esc(selected)}</button></form>`;
+  const peers = nodes().filter(n => n !== selected), picked = concurrentPicks.get(inputDraftKey()) || new Set();
+  const concurrent = peers.length ? `<fieldset class="concurrent-targets"><legend>同时发送到（并发事件）</legend><div class="concurrent-list">${peers.map(n => `<label class="checkbox"><input type="checkbox" data-concurrent="${esc(n)}" ${picked.has(n) ? 'checked' : ''}>${esc(n)}</label>`).join('')}</div><p class="form-help">勾选的节点在同一时刻收到同一操作和参数，彼此之间没有因果关系。</p></fieldset>` : '';
+  return `<form class="application-form" data-action="${esc(s.action)}" data-label="${esc(s.label)}"><h4>${esc(s.label)}</h4>${s.description ? `<p class="form-help">${esc(s.description)}</p>` : ''}${controls}${concurrent}<button type="submit" class="button primary">发送至 ${esc(selected)}</button></form>`;
 }
 function renderApplicationInput() {
   const panel = $('#application-panel'), node = selected, schema = nodeInputSchema(node), key = inputDraftKey(node);
@@ -499,9 +506,19 @@ function renderApplicationInput() {
   }
   if ($('#input-action') && $('#input-action').value !== chosen) $('#input-action').value = chosen;
   const reason = run.status !== 'running' ? '实验未运行，无法发送输入。' : !liveOnline(node) ? `${node} 当前离线，无法发送输入。` : '';
+  const picked = concurrentPicks.get(key) || new Set();
   for (const form of panel.querySelectorAll('form.application-form')) {
     form.hidden = form.dataset.action !== chosen;
-    form.querySelector('button[type="submit"]').disabled = !!reason || pending.has(inputOperation(node, form.dataset.action));
+    let targets = 0;
+    for (const box of form.querySelectorAll('[data-concurrent]')) {
+      const peer = box.dataset.concurrent, ok = !!peerAction(peer, form.dataset.label);
+      box.disabled = !ok; box.checked = ok && picked.has(peer);
+      box.parentElement.title = ok ? '' : liveOnline(peer) ? `${peer} 没有声明 ${form.dataset.label}` : `${peer} 离线`;
+      if (box.checked) targets++;
+    }
+    const button = form.querySelector('button[type="submit"]');
+    button.disabled = !!reason || pending.has(inputOperation(node, form.dataset.action));
+    button.textContent = targets ? `同时发送至 ${node} 等 ${targets + 1} 个节点` : `发送至 ${node}`;
   }
   $('#application-note').textContent = reason || (live ? '输入发送至实时节点，并记录在事件流和时空图中。' : '当前为回放；输入仍发送至正在运行的实时节点。');
   $('#application-note').classList.toggle('warning', !!reason);
@@ -514,6 +531,11 @@ function renderApplicationInput() {
   }
 }
 $('#application-panel').addEventListener('input', e => {
+  if (e.target.dataset.concurrent) {
+    const key = inputDraftKey(), picked = concurrentPicks.get(key) || new Set();
+    if (e.target.checked) picked.add(e.target.dataset.concurrent); else picked.delete(e.target.dataset.concurrent);
+    concurrentPicks.set(key, picked); renderDirty = true; render(); return;
+  }
   const form = e.target.closest('form');
   if (!form || !e.target.name) return;
   const key = inputDraftKey(), draft = inputDrafts.get(key) || {};
@@ -542,6 +564,16 @@ $('#application-panel').addEventListener('submit', guard(async e => {
         try { values[f.name] = JSON.parse(el.value); } catch { throw new Error(`${f.label} 不是有效 JSON`); }
       } else values[f.name] = f.type === 'number' ? Number(el.value) : el.value;
     }
+  }
+  const peers = [...form.querySelectorAll('[data-concurrent]:checked')].map(box => ({ node: box.dataset.concurrent, action: peerAction(box.dataset.concurrent, schema.label) })).filter(p => p.action);
+  if (peers.length) {
+    await mutate({ key: inputOperation(node, action), path: `/api/runs/${run.id}/commands`, body: { batch: [{ node, action, values }, ...peers.map(p => ({ ...p, values }))] },
+      success: (result, current) => {
+        if (!current) return;
+        const failed = result.commands.filter(c => c.error);
+        notify(failed.length ? `并发输入部分失败：${failed.map(c => `${c.node} ${c.error}`).join('；')}` : `并发输入已同时发送至 ${result.commands.map(c => c.node).join('、')}`);
+      } });
+    return;
   }
   await mutate({ key: inputOperation(node, action), path: `/api/runs/${run.id}/commands`, body: { node, action, values },
     success: (result, current) => { if (current) notify(`应用输入已发送 · #${result.commandSeq}`); } });
@@ -586,10 +618,11 @@ function linkBase() {
   const { a, b, dir } = linkSel;
   return JSON.stringify(dir === 'both' ? [linkRule(a, b) || null, linkRule(b, a) || null] : linkRule(...linkEnds()) || null);
 }
-function fillLinkForm(values) { $('#link-latency').value = values.latency; $('#link-bandwidth').value = values.bandwidth; $('#link-blocked').checked = values.blocked; }
+function fillLinkForm(values) { $('#link-latency').value = values.latency; $('#link-bandwidth').value = values.bandwidth; $('#link-blocked').checked = values.blocked; $('#link-model').value = values.delayModel || 'fixed'; $('#link-jitter').value = values.jitter ?? 0; $('#link-jitter').disabled = $('#link-model').value !== 'exponential'; }
 function liveLinkValues() {
   const rule = linkRule(...linkEnds());
-  return { latency: String(rule?.latency ?? run.config.latency), bandwidth: String(rule?.bandwidth ?? run.config.bandwidth), blocked: !!rule?.blocked };
+  const model = rule?.delayModel ?? run.config.delayModel ?? 'fixed';
+  return { latency: String(rule?.latency ?? run.config.latency), bandwidth: String(rule?.bandwidth ?? run.config.bandwidth), blocked: !!rule?.blocked, delayModel: model, jitter: String(model === 'fixed' ? 0 : rule?.delayModel ? rule.jitter : run.config.jitter ?? 0) };
 }
 function renderLinkPopover() {
   const { a, b, dir } = linkSel, ab = linkRule(a, b), ba = linkRule(b, a);
@@ -745,7 +778,7 @@ function render() {
 function renderPanels(state) {
   if (run) {
     $('#experiment-name').textContent = run.config.name;
-    $('#experiment-meta').textContent = `${run.config.nodeCount} 个节点 · ${ { simulation: '内置参考模型', docker: 'Docker / 真实 Go', kubernetes: 'K8s / 真实 Go' }[run.config.runtime]} · ${run.config.latency} ms 延迟${run.config.runtime==='simulation'?` · Seed ${run.config.seed}`:''}`;
+    $('#experiment-meta').textContent = `${run.config.nodeCount} 个节点 · ${ { simulation: '内置参考模型', docker: 'Docker / 真实 Go', kubernetes: 'K8s / 真实 Go' }[run.config.runtime]} · ${run.config.latency}${jitterText(run.config.delayModel, run.config.jitter)} ms 延迟${run.config.runtime==='simulation'?` · Seed ${run.config.seed}`:''}`;
     $('#run-status').textContent = statuses[run.status];
     $('#run-status').className = `badge ${run.status === 'running' ? '' : run.status === 'failed' ? 'failed' : 'neutral'}`;
     $('#mode-label').textContent = live ? '● 实时观察' : playing ? `▶ ${speed}× 回放` : 'Ⅱ 回放已暂停';
@@ -913,7 +946,7 @@ function saveLinkDraft() {
   if (!linkSel || !run) return;
   // The baseline is the live rule when editing began, so a later live change is still reported.
   const key = linkOperation(), base = linkDrafts.get(key)?.base ?? $('#link-form').dataset.base;
-  linkDrafts.set(key, { latency: $('#link-latency').value, bandwidth: $('#link-bandwidth').value, blocked: $('#link-blocked').checked, base });
+  linkDrafts.set(key, { latency: $('#link-latency').value, bandwidth: $('#link-bandwidth').value, blocked: $('#link-blocked').checked, delayModel: $('#link-model').value, jitter: $('#link-jitter').value, base });
   renderDirty = true;
 }
 $('#link-form').addEventListener('input', saveLinkDraft);
@@ -924,13 +957,14 @@ $('#link-form').addEventListener('submit', guard(async e => {
   if (!linkSel || !run) return;
   const { dir } = linkSel, [from, to] = linkEnds(), key = linkOperation(), submitted = linkDrafts.get(key);
   const latency = String($('#link-latency').value).trim(), bandwidth = String($('#link-bandwidth').value).trim();
+  const delayModel = $('#link-model').value, jitter = delayModel === 'fixed' ? '0' : String($('#link-jitter').value).trim();
   const valid = (text, min, max) => /^\d+$/.test(text) && Number(text) >= min && Number(text) <= max;
-  if (!valid(latency, 0, 30000) || !valid(bandwidth, 1, 100000)) {
-    popoverError = { target: linkOperation(), message: '延迟须为 0–30000 的整数毫秒，带宽须为 1–100000 的整数 KiB/s。' };
+  if (!valid(latency, 0, 30000) || !valid(bandwidth, 1, 100000) || !valid(jitter, delayModel === 'fixed' ? 0 : 1, 30000)) {
+    popoverError = { target: linkOperation(), message: '延迟须为 0–30000 的整数毫秒，带宽须为 1–100000 的整数 KiB/s，指数抖动均值须为 1–30000 毫秒。' };
     renderDirty = true; render(); return;
   }
   await mutate({ key: linkOperation(), fault: true, path: `/api/runs/${run.id}/faults`,
-    body: { kind: 'link', from, to, latency: Number(latency), bandwidth: Number(bandwidth), blocked: $('#link-blocked').checked, bidirectional: dir === 'both' },
+    body: { kind: 'link', from, to, latency: Number(latency), bandwidth: Number(bandwidth), blocked: $('#link-blocked').checked, bidirectional: dir === 'both', delayModel, jitter: Number(jitter) },
     // Edits typed while the request was in flight are newer than what was sent; keep them.
     // Only a reply the user is still looking at retires the draft, and only the exact draft that was sent.
     success: (result, current) => { if (!current) return; if (linkDrafts.get(key) === submitted) { linkDrafts.delete(key); $('#link-form').dataset.key = ''; } notify('链路设置已应用并归档'); } });
@@ -997,7 +1031,7 @@ async function refreshProtocols() {
 function scopedRuns() { return runs.filter(r=>r.config.experimentId===experiment?.id); }
 function experimentCard(item) {
   const active=['running','starting'].includes(item.latestRun?.status);
-  return `<button class="experiment-card" data-experiment="${esc(item.id)}"><span class="item-icon">${icon('flask')}</span><span class="item-main"><strong>${esc(item.name)}</strong><small>${item.settings.nodeCount} 节点 · ${item.settings.latency} ms · ${esc(item.settings.runtime)} · ${item.runCount} 次运行</small></span>${active?`<span class="badge">${statuses[item.latestRun.status]}</span>`:''}<span class="item-arrow" aria-hidden="true">→</span></button>`;
+  return `<button class="experiment-card" data-experiment="${esc(item.id)}"><span class="item-icon">${icon('flask')}</span><span class="item-main"><strong>${esc(item.name)}</strong><small>${item.settings.nodeCount} 节点 · ${item.settings.latency}${jitterText(item.settings.delayModel, item.settings.jitter)} ms · ${esc(item.settings.runtime)} · ${item.runCount} 次运行</small></span>${active?`<span class="badge">${statuses[item.latestRun.status]}</span>`:''}<span class="item-arrow" aria-hidden="true">→</span></button>`;
 }
 function renderLibrary() {
   const query=$('#experiment-search').value.toLowerCase();
@@ -1087,7 +1121,9 @@ async function configureRun() {
   const active=experiments.find(e=>['starting','running'].includes(e.latestRun?.status));
   if(active)throw new Error(`「${active.name}」仍在运行，请先结束该次运行`);
   const form=$('#new-form');
+  form.elements.delayModel.value='fixed';form.elements.jitter.value=0;
   for(const [key,value] of Object.entries(experiment.settings))if(form.elements[key])form.elements[key].value=value;
+  syncJitterField(form.elements.delayModel,form.elements.jitter);
   form.elements.name.value=`${experiment.name} · 第 ${scopedRuns().length+1} 次运行`.slice(0,100);
   const model=form.elements.runtime.querySelector('[value="simulation"]');model.disabled=!['raft','token','gossip'].includes(experiment.protocol);
   if(model.disabled && form.elements.runtime.value==='simulation')form.elements.runtime.value='docker';
@@ -1113,7 +1149,7 @@ $('#new-form').onsubmit=guard(async e=>{
   e.preventDefault();const button=e.target.querySelector('[type="submit"]');button.disabled=true;
   try{
     const input=Object.fromEntries(new FormData(e.target));
-    const settings=Object.fromEntries(['runtime','nodeCount','seed','latency','bandwidth'].map(k=>[k,input[k]]));
+    const settings=Object.fromEntries(['runtime','nodeCount','seed','latency','bandwidth','delayModel','jitter'].map(k=>[k,input[k]]));
     if(runFormMode==='create'){
       const item=await api('/api/experiments',{name:input.name,protocolId:protocolProject.id,settings});
       $('#new-dialog').close();await refreshRuns();await openExperiment(item.id);return;
@@ -1131,7 +1167,7 @@ function renderHistory() {
   const expanded=new Set($$('#history-list details[open]').map(d=>d.dataset.runInfo));
   const history=scopedRuns();
   $('#history-count').textContent=history.length;
-  $('#history-list').innerHTML=history.map(r=>`<article class="history-row"><span class="metric-icon teal-bg">${icon('history')}</span><div><h3>${esc(r.config.name)} <span class="badge neutral">${statuses[r.status]}</span></h3><p>${r.config.nodeCount} 节点 · ${esc(r.config.runtime)} · ${new Date(r.createdAt).toLocaleString('zh-CN')} · ${r.eventCount} 事件</p><details class="history-config" data-run-info="${r.id}" ${expanded.has(r.id)?'open':''}><summary>配置与代码</summary><p>延迟 ${r.config.latency} ms · 带宽 ${r.config.bandwidth} KiB/s · 协议 v${r.config.protocolRevision || '旧版'} · 代码 ${esc(r.config.project?.sha256?.slice(0,8) || '旧版快照')}</p><div class="workspace-buttons"><button class="button small" data-source-run="${r.id}">查看代码</button><button class="button small" data-export="${r.id}">导出记录</button></div></details></div><button class="button" data-history="${r.id}">${['running','starting'].includes(r.status)?'进入运行':'回放'} →</button></article>`).join('') || '<div class="library-empty"><h3>这个实验还没有运行记录</h3><p>点击上方「运行实验」。每次运行及其故障、代码都会保存在这里。</p></div>';
+  $('#history-list').innerHTML=history.map(r=>`<article class="history-row"><span class="metric-icon teal-bg">${icon('history')}</span><div><h3>${esc(r.config.name)} <span class="badge neutral">${statuses[r.status]}</span></h3><p>${r.config.nodeCount} 节点 · ${esc(r.config.runtime)} · ${new Date(r.createdAt).toLocaleString('zh-CN')} · ${r.eventCount} 事件</p><details class="history-config" data-run-info="${r.id}" ${expanded.has(r.id)?'open':''}><summary>配置与代码</summary><p>延迟 ${r.config.latency}${jitterText(r.config.delayModel, r.config.jitter)} ms · 带宽 ${r.config.bandwidth} KiB/s · 协议 v${r.config.protocolRevision || '旧版'} · 代码 ${esc(r.config.project?.sha256?.slice(0,8) || '旧版快照')}</p><div class="workspace-buttons"><button class="button small" data-source-run="${r.id}">查看代码</button><button class="button small" data-export="${r.id}">导出记录</button></div></details></div><button class="button" data-history="${r.id}">${['running','starting'].includes(r.status)?'进入运行':'回放'} →</button></article>`).join('') || '<div class="library-empty"><h3>这个实验还没有运行记录</h3><p>点击上方「运行实验」。每次运行及其故障、代码都会保存在这里。</p></div>';
 }
 async function showHistory(){viewWorkspace('history');await refreshRuns();}
 $('#history-list').onclick=guard(async e=>{
@@ -1295,7 +1331,7 @@ function renderProtocolShell(){
   $('#protocol-tabs').hidden=child;$('#experiment-tabs').hidden=!child;
   if(child)$('#history-count').textContent=scopedRuns().length;
   $('#workspace-title').textContent=child?experiment.name:protocolProject.name;
-  $('#workspace-description').textContent=child?`${experiment.settings.nodeCount} 节点 · ${experiment.settings.latency} ms · ${experiment.settings.runtime}`:'';
+  $('#workspace-description').textContent=child?`${experiment.settings.nodeCount} 节点 · ${experiment.settings.latency}${jitterText(experiment.settings.delayModel, experiment.settings.jitter)} ms · ${experiment.settings.runtime}`:'';
   $('#breadcrumb-protocol').hidden=false;$('#breadcrumb-protocol').textContent=protocolProject.name;
   $('#breadcrumb-separator').hidden=false;$('#breadcrumb-child-separator').hidden=!child;$('#breadcrumb-experiment').textContent=child?experiment.name:'';
   $('#workspace-new-experiment').hidden=child;
@@ -1340,13 +1376,22 @@ $('#archive-workspace').onclick=guard(async()=>{
   if(kind==='experiments')await openExperiment(item.id);else await openProtocol(item.id);
   notify(archived?'已归档，代码和历史保留，可随时恢复':'已恢复到正常列表');
 });
+// The mean only applies to the exponential model; a fixed model keeps it at 0.
+function syncJitterField(model,jitter,changed=false){
+  const exp=model.value==='exponential';
+  jitter.disabled=!exp;
+  if(!exp)jitter.value=0;else if(changed && !(Number(jitter.value)>0))jitter.value=50;
+}
+$('#new-form').elements.delayModel.addEventListener('change',e=>syncJitterField(e.target,$('#new-form').elements.jitter,true));
+$('#link-model').addEventListener('change',e=>{syncJitterField(e.target,$('#link-jitter'),true);saveLinkDraft();});
 async function newChild(){
   if(!protocolProject)return;
   runFormMode='create';const form=$('#new-form');
-  for(const [k,v] of Object.entries({name:`实验 ${experiments.filter(e=>e.protocolId===protocolProject.id).length+1}`,runtime:'docker',nodeCount:5,latency:80,bandwidth:128,seed:42}))form.elements[k].value=v;
+  for(const [k,v] of Object.entries({name:`实验 ${experiments.filter(e=>e.protocolId===protocolProject.id).length+1}`,runtime:'docker',nodeCount:5,latency:80,bandwidth:128,delayModel:'fixed',jitter:0,seed:42}))form.elements[k].value=v;
   $('#run-dialog-title').textContent='在此协议下新建实验';$('#run-name-label').textContent='实验名称';$('#run-project-name').textContent=protocolProject.name;
   $('#run-submit').textContent='创建实验 →';$('#run-dialog-note').textContent='保存配置，随后可以运行并注入故障';$('#save-experiment-settings').hidden=true;
   form.elements.runtime.querySelector('[value="simulation"]').disabled=!['raft','token','gossip'].includes(protocolProject.protocol);
+  syncJitterField(form.elements.delayModel,form.elements.jitter);
   $('#new-dialog').showModal();
 }
 $('#protocol-code-tab').onclick=()=>{codeArchive=null;showProtocolView('code');};
@@ -1355,7 +1400,7 @@ $('#workspace-new-experiment').onclick=guard(newChild);
 $('#breadcrumb-protocol').onclick=guard(()=>openProtocol(protocolProject.id));
 $('#archived-child-cards').onclick=$('#child-experiment-cards').onclick=guard(e=>{const b=e.target.closest('[data-experiment]');if(b)return openExperiment(b.dataset.experiment);});
 $('#save-experiment-settings').onclick=guard(async()=>{
-  const form=$('#new-form'),settings=Object.fromEntries(['runtime','nodeCount','latency','bandwidth','seed'].map(k=>[k,form.elements[k].value]));
+  const form=$('#new-form'),settings=Object.fromEntries(['runtime','nodeCount','latency','bandwidth','seed','delayModel','jitter'].map(k=>[k,form.elements[k].value]));
   experiment=await api(`/api/experiments/${experiment.id}`,{revision:experiment.revision,settings});renderProtocolShell();$('#new-dialog').close();await refreshRuns();notify('已保存此实验的参数');
 });
 function frame(now) {

@@ -21,7 +21,7 @@ test('agent creates a directory protocol, imports safely, resyncs by revision an
   function data(result){assert.ok(!result.isError,JSON.stringify(result));return result.structuredContent;}
   try{
     await client.connect(transport);
-    assert.equal((await client.listTools()).tools.length,11);
+    assert.equal((await client.listTools()).tools.length,12);
     const resources=await client.listResources();assert.equal(resources.resources.length,3);
     assert.match((await client.readResource({uri:'distvis://docs/go'})).contents[0].text,/Runtime 生命周期/);
     assert.ok((await client.getPrompt({name:'create_protocol',arguments:{description:'实现互斥算法'}})).messages[0].content.text.includes('实现互斥算法'));

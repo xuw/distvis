@@ -115,3 +115,24 @@ test('recovering an already online node does not duplicate its timers', () => {
   a.advance(5000); b.advance(5000);
   assert.equal(a.events.filter(e => e.type === 'send').length, b.events.filter(e => e.type === 'send').length);
 });
+test('exponential jitter adds seeded Exp(mean) delay but keeps each link FIFO', () => {
+  const run = new Experiment({ protocol: 'custom', runtime: 'docker', nodeCount: 2, latency: 100, bandwidth: 100000, delayModel: 'exponential', jitter: 200, seed: 7 });
+  run.start();
+  const arrivals = [];
+  run.on('deliver', m => arrivals.push(m.payload.i));
+  for (let i = 0; i < 400; i++) { run.send('node-1', 'node-2', { i }); run.advance(5); }
+  run.advance(60000);
+  assert.deepEqual(arrivals, [...arrivals].sort((a, b) => a - b));
+  const jitters = run.events.filter(e => e.type === 'send').map(e => e.jitter);
+  const mean = jitters.reduce((a, b) => a + b, 0) / jitters.length;
+  assert.ok(mean > 150 && mean < 250, `mean jitter ${mean}`);
+  assert.ok(jitters.every(j => Number.isInteger(j) && j >= 0));
+  // A fixed link rule overrides the run's model; omitting the model inherits it.
+  run.fault({ kind: 'link', from: 'node-1', to: 'node-2', latency: 50, bandwidth: 100000, blocked: false, bidirectional: false, delayModel: 'fixed', jitter: 0 });
+  run.send('node-1', 'node-2', { i: 'fixed' });
+  assert.equal(run.events.at(-1).delay >= 50, true);
+  assert.equal(run.events.at(-1).jitter, undefined);
+  assert.throws(() => validateConfig({ protocol: 'raft', delayModel: 'exponential', jitter: 0 }));
+  assert.throws(() => validateConfig({ protocol: 'raft', delayModel: 'normal', jitter: 10 }));
+  assert.equal(validateConfig({ protocol: 'raft' }).delayModel, 'fixed');
+});

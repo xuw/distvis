@@ -55,8 +55,8 @@ export function createService(base=process.env.DISTVIS_URL || 'http://localhost:
       const [protocol,experiments]=await Promise.all([api(`/api/protocol-projects/${protocolId}`),api(`/api/protocol-projects/${protocolId}/experiments`)]);
       return {protocol,experiments};
     },
-    async createExperiment({protocolId,name,runtime='docker',nodeCount=3,latency=80,bandwidth=128,seed=42,acceptance=true}){
-      return api('/api/experiments',{protocolId,name,settings:{runtime,nodeCount,latency,bandwidth,seed}},acceptance);
+    async createExperiment({protocolId,name,runtime='docker',nodeCount=3,latency=80,bandwidth=128,delayModel='fixed',jitter=0,seed=42,acceptance=true}){
+      return api('/api/experiments',{protocolId,name,settings:{runtime,nodeCount,latency,bandwidth,delayModel,jitter,seed}},acceptance);
     },
     async startRun({experimentId,name}){
       const r=await api('/api/runs',{experimentId,...(name?{name}:{})});
@@ -72,6 +72,7 @@ export function createService(base=process.env.DISTVIS_URL || 'http://localhost:
       return {...run,nodes,events:page,hasMore,nextAfter:hasMore?page.at(-1).seq:Math.max(after,events.at(-1)?.seq || 0),exportUrl:`${base}/api/runs/${runId}/export`};
     },
     async input({runId,node,action,values}){return api(`/api/runs/${runId}/commands`,{node,action,values});},
+    async inputConcurrent({runId,inputs}){return api(`/api/runs/${runId}/commands`,{batch:inputs});},
     async fault({runId,fault}){return api(`/api/runs/${runId}/faults`,fault);},
     async stopRun({runId}){return api(`/api/runs/${runId}/stop`,{});},
   };

@@ -19,17 +19,27 @@ export function validateConfig(input) {
     seed: Number(input.seed ?? 42),
     latency: Number(input.latency ?? 80),
     bandwidth: Number(input.bandwidth ?? 128),
+    delayModel: input.delayModel || 'fixed',
+    jitter: Number(input.jitter ?? 0),
     ...(input.experimentId ? {experimentId:input.experimentId} : {}),
     ...(input.protocolId ? {protocolId:input.protocolId,protocolRevision:input.protocolRevision} : {}),
     ...(input.project ? { project: structuredClone(input.project) } : {}),
   };
   if (!protocols[config.protocol] && !/^directory:[^/\\]+$/.test(config.protocol)) throw new Error('未知协议');
   if (!['simulation', 'docker', 'kubernetes'].includes(config.runtime)) throw new Error('未知运行环境');
-  for (const [key, min, max] of [['nodeCount', 2, 12], ['seed', 1, 2147483647], ['latency', 0, 30000], ['bandwidth', 1, 100000]]) {
+  for (const [key, min, max] of [['nodeCount', 2, 12], ['seed', 1, 2147483647], ['latency', 0, 30000], ['bandwidth', 1, 100000], ['jitter', 0, 30000]]) {
     if (!Number.isInteger(config[key]) || config[key] < min || config[key] > max) throw new Error(`${key} 应为 ${min}–${max} 的整数`);
   }
+  validateDelayModel(config);
+  if (config.delayModel === 'fixed') config.jitter = 0;
   if (config.runtime === 'simulation' && (config.protocol === 'custom' || config.protocol.startsWith('directory:'))) throw new Error('自定义 Go 程序请选择 Docker 或 Kubernetes');
   return config;
+}
+
+export const delayModels = ['fixed', 'exponential'];
+function validateDelayModel(rule) {
+  if (!delayModels.includes(rule.delayModel)) throw new Error('delayModel 应为 fixed 或 exponential');
+  if (rule.delayModel === 'exponential' && rule.jitter < 1) throw new Error('指数分布抖动的均值 jitter 应为 1–30000 毫秒');
 }
 
 // All protocol traffic traverses this transport. No protocol-specific fault rules.
@@ -53,6 +63,7 @@ export class Experiment extends EventEmitter {
     this.messageSeq = 0;
     this.randomState = this.config.seed;
     this.nextWire = {};
+    this.lastArrival = {};
     this.actors = {};
     this.inputSchemas = {};
     this.durationLimit = 600000;
@@ -107,8 +118,14 @@ export class Experiment extends EventEmitter {
     const wireStart = Math.max(this.time, this.nextWire[key] || 0);
     const wireEnd = wireStart + Math.ceil(bytes / (bandwidth * 1024) * 1000);
     this.nextWire[key] = wireEnd;
-    const delay = wireEnd - this.time + (link.latency ?? this.config.latency);
-    const message = { id, from, to, payload: structuredClone(payload), bytes, delay };
+    const model = link.delayModel ?? this.config.delayModel, mean = link.jitter ?? this.config.jitter;
+    // Exponential jitter on top of the fixed latency; seeded, so a model run stays reproducible.
+    const jitter = model === 'exponential' ? Math.round(-mean * Math.log(1 - this.random())) : 0;
+    // Each directed link stays FIFO like a TCP connection: jitter delays, never reorders.
+    const arrival = Math.max(wireEnd + (link.latency ?? this.config.latency) + jitter, this.lastArrival[key] || 0);
+    this.lastArrival[key] = arrival;
+    const delay = arrival - this.time;
+    const message = { id, from, to, payload: structuredClone(payload), bytes, delay, ...(model === 'exponential' ? { jitter } : {}) };
     this.log('send', message);
     if (this.status !== 'running') return;
     const sourceEpoch = this.epochs[from], targetEpoch = this.epochs[to];
@@ -157,6 +174,10 @@ export class Experiment extends EventEmitter {
         if (!Number.isInteger(fault[key]) || fault[key] < min || fault[key] > max) throw new Error(`${key} 超出范围`);
       }
       if (typeof fault.blocked !== 'boolean' || typeof fault.bidirectional !== 'boolean') throw new Error('链路选项应为布尔值');
+      if (fault.delayModel !== undefined || fault.jitter !== undefined) {
+        if (!Number.isInteger(fault.jitter ?? 0) || (fault.jitter ?? 0) < 0 || fault.jitter > 30000) throw new Error('jitter 超出范围');
+        validateDelayModel({ delayModel: fault.delayModel ?? 'fixed', jitter: fault.jitter ?? 0 });
+      }
     }
   }
   fault(fault) {
@@ -177,6 +198,8 @@ export class Experiment extends EventEmitter {
       this.links = {};
     } else {
       const rule = { latency: fault.latency, bandwidth: fault.bandwidth, blocked: fault.blocked };
+      // Omitted delay model inherits the run's; an explicit fixed model disables jitter on this link.
+      if (fault.delayModel !== undefined) Object.assign(rule, { delayModel: fault.delayModel, jitter: fault.delayModel === 'fixed' ? 0 : fault.jitter });
       this.links[`${fault.from}>${fault.to}`] = rule;
       if (fault.bidirectional) this.links[`${fault.to}>${fault.from}`] = rule;
     }
@@ -187,27 +210,48 @@ export class Experiment extends EventEmitter {
     this.inputSchemas[node] = structuredClone(schema);
     this.log('input_schema', { node, schema });
   }
-  command(node, key, value, action = 'write', values) {
-    if (this.status !== 'running' || !this.nodes.includes(node) || !this.online[node]) throw new Error('节点未运行');
+  // Validation shared by single and batched inputs; nothing is logged until every input is valid.
+  prepareCommand(node, key, value, action = 'write', values) {
+    if (this.status !== 'running' || !this.nodes.includes(node) || !this.online[node]) throw new Error(`${node} 未运行`);
     if (this.mutating) throw new Error('故障操作正在执行，请稍后提交');
     const schema = this.inputSchemas[node]?.find(s => s.action === action);
-    if (!schema) throw new Error('节点未声明此输入动作');
+    if (!schema) throw new Error(`${node} 未声明此输入动作`);
     // Retain the original key/value API for existing clients.
     if (values === undefined) values = { ...(key === undefined ? {} : { key }), ...(value === undefined ? {} : { value }) };
     validateValues(schema, values);
     const cmd = { node, action, values: structuredClone(values) };
     if (typeof values.key === 'string') cmd.key = values.key;
     if (typeof values.value === 'string') cmd.value = values.value;
-    const event = this.log('command', cmd);
+    return cmd;
+  }
+  dispatch(cmd, extra = {}) {
+    const event = this.log('command', { ...cmd, ...extra });
     if (!event || this.status !== 'running') throw new Error('实验已结束');
     cmd.id = `input-${event.seq}`;
     try {
-      if (this.config.runtime === 'simulation') this.actors[node].command(cmd);
+      if (this.config.runtime === 'simulation') this.actors[cmd.node].command(cmd);
       else if (!this.emit('command', cmd)) throw new Error('节点会话不可写');
     } catch (error) {
-      this.log('command_error', { node, commandSeq: event.seq, message: error.message });
+      this.log('command_error', { node: cmd.node, commandSeq: event.seq, message: error.message });
       throw error;
     }
     return { commandSeq: event.seq, id: cmd.id };
+  }
+  command(node, key, value, action = 'write', values) {
+    return this.dispatch(this.prepareCommand(node, key, value, action, values));
+  }
+  // Concurrent inputs: all are validated first, then delivered at the same coordinator time,
+  // so the nodes start their operations without any causal relation between them.
+  commandBatch(batch) {
+    if (!Array.isArray(batch) || batch.length < 1 || batch.length > this.nodes.length) throw new Error(`batch 应包含 1–${this.nodes.length} 个输入`);
+    if (new Set(batch.map(b => b?.node)).size !== batch.length) throw new Error('同一批输入中每个节点只能出现一次');
+    const cmds = batch.map(b => this.prepareCommand(b.node, undefined, undefined, b.action, b.values ?? {}));
+    const group = `batch-${this.events.length + 1}`, nodes = cmds.map(c => c.node);
+    const results = [];
+    for (const cmd of cmds) {
+      try { results.push({ node: cmd.node, ...this.dispatch(cmd, { batch: group, concurrentWith: nodes.filter(n => n !== cmd.node) }) }); }
+      catch (error) { results.push({ node: cmd.node, error: error.message }); }
+    }
+    return { batch: group, commands: results };
   }
 }

@@ -190,7 +190,11 @@ POST /api/workspace/validate
 | `nodeCount` | 5 | 2–12 的整数 |
 | `latency` | 80 | 0–30000，毫秒 |
 | `bandwidth` | 128 | 1–100000，KiB/s，每条有向链路 |
-| `seed` | 42 | 1–2147483647 的整数，只控制内置模型 |
+| `delayModel` | `fixed` | `fixed` 固定延迟；`exponential` 在 latency 之上为每条消息再加指数分布抖动 |
+| `jitter` | 0 | 0–30000，毫秒；exponential 时为抖动均值，须 ≥1；fixed 时保存为 0 |
+| `seed` | 42 | 1–2147483647 的整数，控制内置模型和延迟抖动的随机序列 |
+
+指数抖动：消息的传输时间为「带宽排队 + latency + Exp(jitter)」，抽样取整到毫秒并记录在 send 事件的 `jitter` 字段。每条有向链路仍保持 FIFO（与 TCP 相同）：抖动只会推迟后续消息，不会让它们越过先发的消息。平台每 50 ms 推进一次消息投递，实际到达时间另有最多约 50 ms 的量化误差。
 
 提交 settings 是整体替换，省略字段会回到默认值；要修改一个参数，请先 GET，再合并原 settings 后提交。`simulation` 仅用于 raft、token、gossip 来源对应的内置模型；它不执行协议 Go 代码。
 
@@ -280,6 +284,17 @@ schema 最多 64 动作、每个 16 字段、声明总计 48 KiB；values 必须
 
 运行必须处于 running，目标节点在线且已声明 action。故障操作期间输入可能被拒绝。应用输入始终发送到实时节点，不受浏览器回放位置影响。
 
+### 并发输入
+
+```json
+{"batch":[
+  {"node":"node-1","action":"从 node-1 的 input_schema 取得","values":{"holdMs":3000}},
+  {"node":"node-3","action":"从 node-3 的 input_schema 取得","values":{"holdMs":3000}}
+]}
+```
+
+用同一个 `POST /api/runs/{runId}/commands` 提交。平台先校验全部输入（节点在线、已声明 action、字段合法、节点不重复，最多 nodeCount 项），任一不合法则整批拒绝、不发送；通过后在同一协调器时刻依次交给各节点，因此这些操作彼此没有因果关系，可用来构造并发事件。返回 `{"ok":true,"batch":"batch-57","commands":[{"node":"node-1","commandSeq":57,"id":"input-57"},…]}`，某个节点在交付时失败会在对应项给出 `error`。每个 `command` 事件带 `batch` 和 `concurrentWith`（同批其他节点）；各自的结果仍按 `commandId` 等待 command_result。浏览器中，在节点的「应用输入」里勾选「同时发送到」即可。
+
 兼容请求 `{node,key,value}` 使用默认 action=write；只对声明了 write 的协议有意义。
 
 ## 故障注入
@@ -292,7 +307,7 @@ POST /api/runs/{runId}/faults
 | --- | --- | --- |
 | `crash` | node | 杀死真实节点进程/容器或停止模型节点 |
 | `recover` | node | 恢复该节点，同次运行的持久状态保留 |
-| `link` | from、to、latency、bandwidth、blocked、bidirectional | 设置有向链路；bidirectional=true 时同步反向链路 |
+| `link` | from、to、latency、bandwidth、blocked、bidirectional，可选 delayModel、jitter | 设置有向链路；bidirectional=true 时同步反向链路；省略 delayModel 时沿用运行的延迟分布 |
 | `heal` | 无其他字段 | 清除全部链路覆盖，恢复运行默认网络；不恢复已崩溃节点 |
 
 ```json
@@ -346,14 +361,14 @@ stream.onmessage = event => {
 | type | 主要字段 |
 | --- | --- |
 | `lifecycle` | action=start/stop，config/nodes 或 reason |
-| `send` | id、from、to、payload、bytes、delay |
+| `send` | id、from、to、payload、bytes、delay，指数抖动时另有 jitter |
 | `receive` / `drop` | id、from、to，drop 的 reason；按 id 关联 send |
 | `deliver` | 真实运行中交付到节点 SDK 的消息；与协议消费后记录的 receive 区分 |
 | `state` | node、state，节点上报的完整状态 |
 | `node` | node、online、可选 reason |
 | `fault` | fault 请求对象 |
 | `input_schema` | node、schema |
-| `command` | node、action、values |
+| `command` | node、action、values；并发输入另有 batch、concurrentWith |
 | `command_result` | node、commandId、result、error |
 | `command_error` | node、commandSeq、message，输入交付失败 |
 | `runtime` / `stdout` / `stderr` 等 | 运行诊断；按实际事件读取 node、message、level、phase 等可选字段 |

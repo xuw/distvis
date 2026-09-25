@@ -70,3 +70,21 @@ test('Raft proposal crosses the configured link and remains pending during parti
   run.fault({ kind: 'heal' }); run.advance(2500);
   assert.equal(run.states[sender].lastProposal.status, 'Leader 已接收（未提交）');
 });
+test('batched inputs reach every node at the same coordinator time, validated before any is sent', () => {
+  const run = create('custom'), received = [];
+  run.on('command', cmd => received.push(cmd));
+  const schema = [{ action: 'go', label: 'Application.Go', fields: [{ name: 'n', label: 'n', type: 'number', required: true }] }];
+  for (const node of run.nodes) run.declareInputs(node, schema);
+  run.advance(120);
+  const result = run.commandBatch(run.nodes.map(node => ({ node, action: 'go', values: { n: 7 } })));
+  assert.deepEqual(received.map(c => c.node), run.nodes);
+  assert.ok(result.commands.every(c => c.id && !c.error));
+  const events = run.events.filter(e => e.type === 'command');
+  assert.equal(new Set(events.map(e => e.time)).size, 1);
+  assert.ok(events.every(e => e.batch === result.batch && e.concurrentWith.length === 2));
+  // One invalid entry rejects the whole batch: nothing is logged or delivered.
+  assert.throws(() => run.commandBatch([{ node: 'node-1', action: 'go', values: { n: 1 } }, { node: 'node-2', action: 'go', values: { n: 'x' } }]));
+  assert.throws(() => run.commandBatch([{ node: 'node-1', action: 'go', values: { n: 1 } }, { node: 'node-1', action: 'go', values: { n: 2 } }]));
+  assert.throws(() => run.commandBatch([]));
+  assert.equal(received.length, 3);
+});
