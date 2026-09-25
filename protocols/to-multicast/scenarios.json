@@ -1,0 +1,95 @@
+{
+  "scenarios": [
+    {
+      "id": "naive-diverge",
+      "name": "全序多播 · naive：副本分歧 1111 与 1110",
+      "settings": {"nodeCount": 3, "latency": 800},
+      "description": "课件第 3 页：北京 node-1 存入 100，上海 node-3 同时计息 1%。naive 模式收到即执行，不同副本以不同顺序执行两个更新：1000+100 再 ×1.01 = 1111，而 1000×1.01 再 +100 = 1110。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Mode", "values": {"mode": "naive"}}},
+        {"input": {"node": "node-2", "method": "Application.Mode", "values": {"mode": "naive"}}},
+        {"input": {"node": "node-3", "method": "Application.Mode", "values": {"mode": "naive"}}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-2", "latency": 100}},
+        {"fault": {"kind": "link", "from": "node-3", "to": "node-2", "latency": 2500}},
+        {"note": "两个更新同时发出；node-2 离 node-1 近、离 node-3 远"},
+        {"input": {"node": "node-1", "method": "Application.Deposit", "values": {"amount": 100}}, "await": false},
+        {"input": {"node": "node-3", "method": "Application.Interest", "values": {"percent": 1}}, "await": false},
+        {"until": {"node": "*", "path": "deliveredCount", "value": 2}, "timeout": 20000, "label": "每个副本都执行了两个更新"},
+        {"check": {"differ": "balance"}, "label": "副本余额不一致"},
+        {"check": {"all": [{"node": "node-1", "path": "balance", "value": 1111}, {"node": "node-2", "path": "balance", "value": 1111}, {"node": "node-3", "path": "balance", "value": 1110}]}, "label": "node-1、node-2 先存款后计息 = 1111；node-3 先计息后存款 = 1110"},
+        {"check": {"differ": "delivered"}, "label": "执行顺序不同"}
+      ]
+    },
+    {
+      "id": "ordered-agree",
+      "name": "全序多播 · ordered：所有副本同序交付",
+      "settings": {"nodeCount": 3, "latency": 800},
+      "description": "同样的并发更新与不对称链路，但更新按 (L, 发送者) 进入优先队列，收齐全部 ACK 且位于队首才交付：两个时间戳 1.1 < 1.3，所有副本都先存款后计息，余额都是 1111。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-2", "latency": 100}},
+        {"fault": {"kind": "link", "from": "node-3", "to": "node-2", "latency": 2500}},
+        {"input": {"node": "node-1", "method": "Application.Deposit", "values": {"amount": 100}}, "await": false},
+        {"input": {"node": "node-3", "method": "Application.Interest", "values": {"percent": 1}}, "await": false},
+        {"wait": 1500},
+        {"check": {"node": "node-3", "path": "balance", "value": 1000}, "label": "node-3 自己的计息也不能立即执行，要等 ACK"},
+        {"until": {"node": "*", "path": "deliveredCount", "value": 2}, "timeout": 30000, "label": "所有副本交付了两个更新"},
+        {"check": {"same": "balance"}, "label": "余额一致"},
+        {"check": {"node": "*", "path": "balance", "value": 1111}, "label": "都是 1111（1.1 的存款排在 1.3 的计息之前）"},
+        {"check": {"same": "delivered"}, "label": "交付序列相同"},
+        {"check": {"node": "*", "path": "delivered", "value": ["1.1 +100", "1.3 +1%"]}, "label": "交付序列为 1.1 +100、1.3 +1%"}
+      ]
+    },
+    {
+      "id": "message-cost",
+      "name": "全序多播 · N=4 的消息开销",
+      "settings": {"nodeCount": 4, "latency": 200},
+      "description": "一次多播需要 N-1 条更新 + N(N-1) 条 ACK（每个接收者都向其他所有节点广播 ACK）。N=4 时每次 3 + 12 = 15 条消息，即 O(N²)。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Deposit", "values": {"amount": 100}}},
+        {"until": {"node": "*", "path": "balance", "value": 1100}, "timeout": 15000, "label": "所有副本交付存款"},
+        {"check": {"messages": {"method": "TOM.Update", "op": "==", "value": 3}}, "label": "N-1 = 3 条 TOM.Update"},
+        {"check": {"messages": {"method": "TOM.Ack", "op": "==", "value": 12}}, "label": "N(N-1) = 12 条 TOM.Ack"},
+        {"input": {"node": "node-2", "method": "Application.Interest", "values": {"percent": 10}}},
+        {"until": {"node": "*", "path": "balance", "value": 1210}, "timeout": 15000, "label": "所有副本交付计息：1100 × 1.1 = 1210"},
+        {"check": {"messages": {"method": "TOM.Update", "op": "==", "value": 6}}, "label": "两次多播共 6 条更新"},
+        {"check": {"messages": {"method": "TOM.Ack", "op": "==", "value": 24}}, "label": "两次多播共 24 条 ACK"},
+        {"check": {"node": "*", "path": "queue", "value": []}, "label": "所有队列已清空"}
+      ]
+    },
+    {
+      "id": "crash-blocks",
+      "name": "全序多播 · 一个节点崩溃，全体停止交付",
+      "settings": {"nodeCount": 3, "latency": 300},
+      "description": "node-3 崩溃后，node-1 的存款在所有存活副本的队首等待 node-3 的 ACK（acks=2/3），谁都不能交付。node-3 恢复后，重发的更新与 ACK 到达，交付继续。",
+      "steps": [
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"input": {"node": "node-1", "method": "Application.Deposit", "values": {"amount": 100}}},
+        {"wait": 5000},
+        {"check": {"node": ["node-1", "node-2"], "path": "queue", "value": ["1.1 +100 acks=2/3"]}, "label": "存活副本的队首缺 node-3 的 ACK"},
+        {"check": {"node": ["node-1", "node-2"], "path": "balance", "value": 1000}, "label": "没有副本能交付"},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"node": "*", "path": "balance", "value": 1100}, "timeout": 40000, "label": "node-3 恢复后三个副本都交付"},
+        {"check": {"same": "delivered"}, "label": "交付序列一致"}
+      ]
+    },
+    {
+      "id": "crash-persist",
+      "name": "全序多播 · 崩溃恢复后靠持久化的队列继续",
+      "settings": {"nodeCount": 3, "latency": 300},
+      "description": "node-2 崩溃时 node-1 存款；node-3 随后也崩溃，发往 node-2 的 ACK 丢在内存里。两者恢复后，node-3 从持久化的队列补发 ACK，所有副本交付。",
+      "steps": [
+        {"fault": {"kind": "crash", "node": "node-2"}},
+        {"input": {"node": "node-1", "method": "Application.Deposit", "values": {"amount": 100}}},
+        {"until": {"node": ["node-1", "node-3"], "path": "queue", "value": ["1.1 +100 acks=2/3"]}, "timeout": 10000, "label": "node-1、node-3 等待 node-2 的 ACK"},
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"fault": {"kind": "recover", "node": "node-2"}},
+        {"until": {"node": "node-1", "path": "balance", "value": 1100}, "timeout": 30000, "label": "node-2 恢复后 node-1 集齐 ACK 并交付"},
+        {"wait": 3000},
+        {"check": {"node": "node-2", "path": "queue", "value": ["1.1 +100 acks=2/3"]}, "label": "node-2 缺 node-3 的 ACK（它随崩溃丢失）"},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"node": "*", "path": "balance", "value": 1100}, "timeout": 30000, "label": "node-3 补发 ACK 后三个副本都交付"},
+        {"check": {"same": "delivered"}, "label": "交付序列一致"}
+      ]
+    }
+  ]
+}

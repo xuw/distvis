@@ -1,0 +1,84 @@
+{
+  "scenarios": [
+    {
+      "id": "startup",
+      "name": "Bully · 启动时选出编号最大的节点",
+      "settings": {"nodeCount": 5, "latency": 150},
+      "description": "所有节点启动后各自发起选举：node-5 没有更高编号，直接成为协调者并广播 Coordinator；其余节点收到更高节点的 OK 后等待 Coordinator。",
+      "steps": [
+        {"until": {"all": [{"node": "*", "path": "leader", "value": "node-5"}, {"node": "node-5", "path": "role", "value": "leader"}]}, "timeout": 15000, "label": "所有节点认定 node-5 为协调者"},
+        {"check": {"node": ["node-1", "node-2", "node-3", "node-4"], "path": "role", "value": "follower"}, "label": "其余节点都是 follower"},
+        {"check": {"node": "node-5", "path": "lastElection", "value": "编号最大，直接成为协调者"}, "label": "node-5 无需等待 OK"},
+        {"check": {"atMostOne": {"path": "role", "value": "leader"}}, "label": "始终只有一个 leader"},
+        {"wait": 3000},
+        {"check": {"node": "*", "path": "role", "op": "!=", "value": "election"}, "label": "心跳维持期间没有新的选举"}
+      ]
+    },
+    {
+      "id": "leader-crash",
+      "name": "Bully · 协调者崩溃，次高节点接任",
+      "settings": {"nodeCount": 5, "latency": 150},
+      "description": "node-5 崩溃；约 3–4 秒没有心跳后，最先发现的节点向更高编号发 Election，更高者回 OK 并接手；node-4 发往 node-5 的 Election 无人回应，node-4 胜出。",
+      "steps": [
+        {"until": {"node": "*", "path": "leader", "value": "node-5"}, "timeout": 15000, "label": "node-5 是协调者"},
+        {"fault": {"kind": "crash", "node": "node-5"}},
+        {"until": {"all": [{"node": "*", "path": "leader", "value": "node-4"}, {"node": "node-4", "path": "role", "value": "leader"}]}, "timeout": 20000, "label": "node-4 成为新协调者"},
+        {"check": {"node": "node-4", "path": "lastElection", "value": "更高编号无人回 OK，成为协调者"}, "label": "node-4 在 OK 超时后自立"},
+        {"check": {"node": ["node-1", "node-2", "node-3"], "path": "role", "value": "follower"}, "label": "其余节点都跟随 node-4"},
+        {"check": {"atMostOne": {"path": "role", "value": "leader"}}, "label": "始终只有一个 leader"},
+        {"check": {"all": [
+          {"messages": {"method": "Bully.Election", "op": ">=", "value": 11}},
+          {"messages": {"method": "Bully.OK", "op": ">=", "value": 7}},
+          {"messages": {"method": "Bully.Coordinator", "op": ">=", "value": 8}}
+        ]}, "label": "启动 + 重选的 Election / OK / Coordinator 消息（见时空图）"}
+      ]
+    },
+    {
+      "id": "slides",
+      "name": "Bully · 课件示例：node-4 发现协调者失效",
+      "settings": {"nodeCount": 7, "latency": 200},
+      "description": "复现课件插图：协调者 node-7 崩溃，node-4 最先发现，向 5、6、7 发 Election；5、6 回 OK 并各自接手选举；6 等不到 7 的 OK，成为协调者并通知所有人。",
+      "steps": [
+        {"until": {"node": "*", "path": "leader", "value": "node-7"}, "timeout": 15000, "label": "node-7 是协调者"},
+        {"fault": {"kind": "crash", "node": "node-7"}},
+        {"input": {"node": "node-4", "method": "Application.StartElection", "values": {}}},
+        {"until": {"node": "node-4", "path": "okFrom", "op": "includes", "value": "node-6"}, "timeout": 5000, "label": "node-4 收到 5、6 的 OK，退出竞争"},
+        {"until": {"all": [{"node": "*", "path": "leader", "value": "node-6"}, {"node": "node-6", "path": "role", "value": "leader"}]}, "timeout": 20000, "label": "node-6 成为协调者，所有节点收到 Coordinator"},
+        {"check": {"node": "node-4", "path": "okFrom", "op": "includes", "value": "node-5"}, "label": "node-5 也回了 OK"},
+        {"check": {"node": ["node-5", "node-6"], "path": "electionsStarted", "op": ">=", "value": 2}, "label": "5、6 接手选举（启动时一次 + 这次）"},
+        {"check": {"node": "node-6", "path": "lastElection", "value": "更高编号无人回 OK，成为协调者"}, "label": "node-6 等不到 node-7 的 OK"},
+        {"check": {"atMostOne": {"path": "role", "value": "leader"}}, "label": "始终只有一个 leader"}
+      ]
+    },
+    {
+      "id": "recover-bully",
+      "name": "Bully · 旧协调者恢复后抢回位置",
+      "settings": {"nodeCount": 5, "latency": 150},
+      "description": "node-5 崩溃后 node-4 接任；node-5 恢复后立即发起选举，没有更高编号，直接宣布自己是协调者，node-4 让位——这就是 bully（恃强凌弱）的由来。",
+      "steps": [
+        {"until": {"node": "*", "path": "leader", "value": "node-5"}, "timeout": 15000, "label": "node-5 是协调者"},
+        {"fault": {"kind": "crash", "node": "node-5"}},
+        {"until": {"node": "*", "path": "leader", "value": "node-4"}, "timeout": 20000, "label": "node-4 接任"},
+        {"fault": {"kind": "recover", "node": "node-5"}},
+        {"until": {"all": [{"node": "*", "path": "leader", "value": "node-5"}, {"node": "node-5", "path": "role", "value": "leader"}, {"node": "node-4", "path": "role", "value": "follower"}]}, "timeout": 20000, "label": "node-5 恢复后重新成为协调者"},
+        {"check": {"node": "node-5", "path": "lastElection", "value": "编号最大，直接成为协调者"}, "label": "恢复的 node-5 直接自立"},
+        {"check": {"moreThanOne": {"path": "role", "value": "leader"}}, "label": "交接瞬间曾有两个 leader（Coordinator 在途）"}
+      ]
+    },
+    {
+      "id": "two-crash",
+      "name": "Bully · 最高的两个节点同时崩溃",
+      "settings": {"nodeCount": 5, "latency": 150},
+      "description": "node-4、node-5 同时崩溃：node-3 发往 4、5 的 Election 都没有回应，它成为协调者；node-1、node-2 的 Election 被 node-3 回 OK。",
+      "steps": [
+        {"until": {"node": "*", "path": "leader", "value": "node-5"}, "timeout": 15000, "label": "node-5 是协调者"},
+        {"fault": {"kind": "crash", "node": "node-5"}},
+        {"fault": {"kind": "crash", "node": "node-4"}},
+        {"until": {"all": [{"node": "*", "path": "leader", "value": "node-3"}, {"node": "node-3", "path": "role", "value": "leader"}]}, "timeout": 20000, "label": "node-3 成为协调者"},
+        {"check": {"node": "node-3", "path": "lastElection", "value": "更高编号无人回 OK，成为协调者"}, "label": "node-3 等 OK 超时后自立"},
+        {"check": {"node": ["node-1", "node-2"], "path": "role", "value": "follower"}, "label": "node-1、node-2 跟随 node-3"},
+        {"check": {"atMostOne": {"path": "role", "value": "leader"}}, "label": "始终只有一个 leader"}
+      ]
+    }
+  ]
+}

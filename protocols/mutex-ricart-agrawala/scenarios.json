@@ -1,0 +1,417 @@
+{
+  "scenarios": [
+    {
+      "id": "concurrent",
+      "name": "R&A · 两个节点同时请求",
+      "settings": {
+        "nodeCount": 3,
+        "latency": 400
+      },
+      "description": "node-1 与 node-3 在同一协调器时刻请求（并发事件）；两个请求的 L 相同，按节点编号决胜，另一方的 OK 被推迟到对方离开临界区。",
+      "steps": [
+        {
+          "concurrent": [
+            {
+              "node": "node-1",
+              "method": "Application.Acquire",
+              "values": {
+                "holdMs": 3000
+              }
+            },
+            {
+              "node": "node-3",
+              "method": "Application.Acquire",
+              "values": {
+                "holdMs": 3000
+              }
+            }
+          ],
+          "await": false
+        },
+        {
+          "until": {
+            "all": [
+              {
+                "node": "node-1",
+                "path": "entries",
+                "op": "==",
+                "value": 1
+              },
+              {
+                "node": "node-3",
+                "path": "entries",
+                "op": "==",
+                "value": 1
+              }
+            ]
+          },
+          "timeout": 20000,
+          "label": "两个请求都进入过临界区"
+        },
+        {
+          "check": {
+            "atMostOne": {
+              "path": "role",
+              "value": "critical"
+            }
+          },
+          "label": "任意时刻至多一个 critical"
+        },
+        {
+          "check": {
+            "messages": {
+              "method": "RA.Request",
+              "op": "==",
+              "value": 4
+            }
+          },
+          "label": "每个请求向 n-1=2 个节点广播"
+        },
+        {
+          "check": {
+            "messages": {
+              "method": "RA.OK",
+              "op": "==",
+              "value": 1
+            }
+          },
+          "label": "恰有一个 OK 被推迟发送"
+        }
+      ]
+    },
+    {
+      "id": "slides-example",
+      "name": "R&A · 课件例子（时间戳而非先后）",
+      "settings": {
+        "nodeCount": 3,
+        "latency": 400
+      },
+      "description": "复现课件：初始时钟 P1=42、P2=11、P3=14。P3 先持锁；P1 在真实时间上先于 P2 请求，但 P2 的时间戳更小，P3 离开后 P2 先进入。",
+      "steps": [
+        {
+          "input": {
+            "node": "node-1",
+            "method": "Application.Tick",
+            "values": {
+              "events": 42
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-2",
+            "method": "Application.Tick",
+            "values": {
+              "events": 11
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-3",
+            "method": "Application.Tick",
+            "values": {
+              "events": 14
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-3",
+            "method": "Application.Acquire",
+            "values": {
+              "holdMs": 4000
+            }
+          },
+          "await": false
+        },
+        {
+          "until": {
+            "node": "node-3",
+            "path": "role",
+            "value": "critical"
+          },
+          "timeout": 10000,
+          "label": "P3 进入临界区"
+        },
+        {
+          "input": {
+            "node": "node-1",
+            "method": "Application.Acquire",
+            "values": {
+              "holdMs": 2000
+            }
+          },
+          "await": false
+        },
+        {
+          "wait": 150
+        },
+        {
+          "input": {
+            "node": "node-2",
+            "method": "Application.Acquire",
+            "values": {
+              "holdMs": 2000
+            }
+          },
+          "await": false
+        },
+        {
+          "until": {
+            "node": "node-2",
+            "path": "role",
+            "value": "critical"
+          },
+          "timeout": 15000,
+          "label": "P2 先于 P1 进入"
+        },
+        {
+          "check": {
+            "node": "node-1",
+            "path": "role",
+            "value": "wanted"
+          },
+          "label": "此时 P1 仍在等待 P2 的 OK"
+        },
+        {
+          "until": {
+            "node": "node-1",
+            "path": "entries",
+            "value": 1
+          },
+          "timeout": 15000,
+          "label": "P1 最终进入"
+        },
+        {
+          "check": {
+            "atMostOne": {
+              "path": "role",
+              "value": "critical"
+            }
+          },
+          "label": "互斥始终成立"
+        }
+      ]
+    },
+    {
+      "id": "crash-blocks",
+      "name": "R&A · 无关节点崩溃也会阻塞",
+      "settings": {
+        "nodeCount": 3,
+        "latency": 200
+      },
+      "description": "node-2 从不申请锁，但它崩溃后 node-1 收不到全部 OK，只能一直等待；node-2 恢复后重试的请求得到回复。",
+      "steps": [
+        {
+          "fault": {
+            "kind": "crash",
+            "node": "node-2"
+          }
+        },
+        {
+          "input": {
+            "node": "node-1",
+            "method": "Application.Acquire",
+            "values": {
+              "holdMs": 1500
+            }
+          },
+          "await": false
+        },
+        {
+          "wait": 6000
+        },
+        {
+          "check": {
+            "node": "node-1",
+            "path": "role",
+            "value": "wanted"
+          },
+          "label": "node-1 被崩溃的 node-2 阻塞"
+        },
+        {
+          "fault": {
+            "kind": "recover",
+            "node": "node-2"
+          }
+        },
+        {
+          "until": {
+            "node": "node-1",
+            "path": "entries",
+            "value": 1
+          },
+          "timeout": 25000,
+          "label": "node-2 恢复后 node-1 进入"
+        }
+      ]
+    },
+    {
+      "id": "auto-load",
+      "name": "R&A · 5 节点随机负载",
+      "settings": {
+        "nodeCount": 5,
+        "latency": 150
+      },
+      "description": "所有节点随机申请临界区，观察时空图中的请求广播、推迟回复与公平性。",
+      "steps": [
+        {
+          "input": {
+            "node": "node-1",
+            "method": "Application.Auto",
+            "values": {
+              "enabled": true,
+              "intervalMs": 2500,
+              "holdMs": 800
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-2",
+            "method": "Application.Auto",
+            "values": {
+              "enabled": true,
+              "intervalMs": 2500,
+              "holdMs": 800
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-3",
+            "method": "Application.Auto",
+            "values": {
+              "enabled": true,
+              "intervalMs": 2500,
+              "holdMs": 800
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-4",
+            "method": "Application.Auto",
+            "values": {
+              "enabled": true,
+              "intervalMs": 2500,
+              "holdMs": 800
+            }
+          }
+        },
+        {
+          "input": {
+            "node": "node-5",
+            "method": "Application.Auto",
+            "values": {
+              "enabled": true,
+              "intervalMs": 2500,
+              "holdMs": 800
+            }
+          }
+        },
+        {
+          "until": {
+            "node": "*",
+            "path": "entries",
+            "op": ">=",
+            "value": 2
+          },
+          "timeout": 60000,
+          "label": "每个节点至少进入 2 次（无饥饿）"
+        },
+        {
+          "check": {
+            "atMostOne": {
+              "path": "role",
+              "value": "critical"
+            }
+          },
+          "label": "任意时刻至多一个 critical"
+        }
+      ]
+    },
+    {
+      "id": "jitter-load",
+      "name": "R&A · 指数抖动网络下的随机负载",
+      "settings": {
+        "nodeCount": 5,
+        "latency": 100,
+        "delayModel": "exponential",
+        "jitter": 300
+      },
+      "description": "每条消息在 100ms 固定延迟上再加均值 300ms 的指数抖动：请求到达顺序与发出顺序不再一致，但 Lamport 全序仍保证互斥与公平。",
+      "steps": [
+        {
+          "concurrent": [
+            {
+              "node": "node-1",
+              "method": "Application.Auto",
+              "values": {
+                "enabled": true,
+                "intervalMs": 2500,
+                "holdMs": 600
+              }
+            },
+            {
+              "node": "node-2",
+              "method": "Application.Auto",
+              "values": {
+                "enabled": true,
+                "intervalMs": 2500,
+                "holdMs": 600
+              }
+            },
+            {
+              "node": "node-3",
+              "method": "Application.Auto",
+              "values": {
+                "enabled": true,
+                "intervalMs": 2500,
+                "holdMs": 600
+              }
+            },
+            {
+              "node": "node-4",
+              "method": "Application.Auto",
+              "values": {
+                "enabled": true,
+                "intervalMs": 2500,
+                "holdMs": 600
+              }
+            },
+            {
+              "node": "node-5",
+              "method": "Application.Auto",
+              "values": {
+                "enabled": true,
+                "intervalMs": 2500,
+                "holdMs": 600
+              }
+            }
+          ]
+        },
+        {
+          "until": {
+            "node": "*",
+            "path": "entries",
+            "op": ">=",
+            "value": 2
+          },
+          "timeout": 80000,
+          "label": "每个节点至少进入 2 次"
+        },
+        {
+          "check": {
+            "atMostOne": {
+              "path": "role",
+              "value": "critical"
+            }
+          },
+          "label": "抖动下互斥仍成立"
+        }
+      ]
+    }
+  ]
+}

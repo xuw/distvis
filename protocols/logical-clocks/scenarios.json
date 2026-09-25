@@ -1,0 +1,91 @@
+{
+  "scenarios": [
+    {
+      "id": "slides-figure",
+      "name": "逻辑时钟 · 课件图：L(b)>L(e) 但 b∥e",
+      "settings": {"nodeCount": 3, "latency": 300},
+      "description": "复现 L05 第 37 页：p1 上 a、b（b 发送 m1），p2 上 c（收 m1）、d（发 m2），p3 上 e（本地）、f（收 m2）。L(b)=2 > L(e)=1，但 b 与 e 并发；向量时钟能区分。",
+      "steps": [
+        {"input": {"node": "node-3", "method": "Application.Local", "values": {"label": "e"}}},
+        {"input": {"node": "node-1", "method": "Application.Local", "values": {"label": "a"}}},
+        {"input": {"node": "node-1", "method": "Application.Send", "values": {"to": "node-2", "label": "b", "recvLabel": "c"}}},
+        {"until": {"node": "node-2", "path": "lamport", "value": 3}, "timeout": 10000, "label": "p2 收到 m1：c 的 L = max(0,2)+1 = 3"},
+        {"input": {"node": "node-2", "method": "Application.Send", "values": {"to": "node-3", "label": "d", "recvLabel": "f"}}},
+        {"until": {"node": "node-3", "path": "lamport", "value": 5}, "timeout": 10000, "label": "p3 收到 m2：f 的 L = max(1,4)+1 = 5"},
+        {"check": {"all": [{"node": "node-1", "path": "vector", "value": "[2,0,0]"}, {"node": "node-2", "path": "vector", "value": "[2,2,0]"}, {"node": "node-3", "path": "vector", "value": "[2,2,2]"}]}, "label": "向量时钟 b=[2,0,0]、d=[2,2,0]、f=[2,2,2]"},
+        {"input": {"node": "node-3", "method": "Application.Compare", "values": {"a": "node-1:2", "b": "node-3:1"}}},
+        {"check": {"all": [{"node": "node-3", "path": "lastCompare.La", "value": 2}, {"node": "node-3", "path": "lastCompare.Lb", "value": 1}, {"node": "node-3", "path": "lastCompare.lamportLess", "value": false}, {"node": "node-3", "path": "lastCompare.vector", "value": "concurrent"}]}, "label": "b 与 e：L(b)=2 > L(e)=1，但向量时钟判定并发"},
+        {"input": {"node": "node-3", "method": "Application.Compare", "values": {"a": "node-3:1", "b": "node-2:1"}}},
+        {"check": {"all": [{"node": "node-3", "path": "lastCompare.lamportLess", "value": true}, {"node": "node-3", "path": "lastCompare.vector", "value": "concurrent"}, {"node": "node-3", "path": "lastCompare.agrees", "value": false}]}, "label": "e 与 c：L(e)=1 < L(c)=3，却不是 e→c"},
+        {"input": {"node": "node-1", "method": "Application.Compare", "values": {"a": "node-1:1", "b": "node-3:2"}}},
+        {"check": {"all": [{"node": "node-1", "path": "lastCompare.vector", "value": "a→b"}, {"node": "node-1", "path": "lastCompare.lamportLess", "value": true}, {"node": "node-1", "path": "lastCompare.Lb", "value": 5}]}, "label": "a→f（传递性），L(a)=1 < L(f)=5"}
+      ]
+    },
+    {
+      "id": "causal-chain",
+      "name": "逻辑时钟 · 跨三个节点的因果链",
+      "settings": {"nodeCount": 3, "latency": 300},
+      "description": "p1 → p2 → p3 的消息链，每一步向量时钟都严格增大；Compare 判定首尾事件 happens-before，Lamport 顺序与之一致。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Local", "values": {"label": "start"}}},
+        {"input": {"node": "node-1", "method": "Application.Send", "values": {"to": "node-2", "label": "m1"}}},
+        {"until": {"node": "node-2", "path": "eventCount", "value": 1}, "timeout": 10000, "label": "p2 收到 m1"},
+        {"input": {"node": "node-2", "method": "Application.Local", "values": {"label": "work"}}},
+        {"input": {"node": "node-2", "method": "Application.Send", "values": {"to": "node-3", "label": "m2"}}},
+        {"until": {"node": "node-3", "path": "eventCount", "value": 1}, "timeout": 10000, "label": "p3 收到 m2"},
+        {"input": {"node": "node-3", "method": "Application.Local", "values": {"label": "end"}}},
+        {"check": {"all": [{"node": "node-1", "path": "vector", "value": "[2,0,0]"}, {"node": "node-2", "path": "vector", "value": "[2,3,0]"}, {"node": "node-3", "path": "vector", "value": "[2,3,2]"}, {"node": "node-3", "path": "lamport", "value": 7}]}, "label": "向量沿因果链逐项取最大再自增"},
+        {"input": {"node": "node-3", "method": "Application.Compare", "values": {"a": "node-1:1", "b": "node-3:2"}}},
+        {"check": {"all": [{"node": "node-3", "path": "lastCompare.vector", "value": "a→b"}, {"node": "node-3", "path": "lastCompare.lamportLess", "value": true}, {"node": "node-3", "path": "lastCompare.agrees", "value": true}]}, "label": "start → end：V 严格小于，L 也更小"},
+        {"input": {"node": "node-2", "method": "Application.Compare", "values": {"a": "node-3:1", "b": "node-2:2"}}},
+        {"check": {"all": [{"node": "node-2", "path": "lastCompare.vector", "value": "b→a"}, {"node": "node-2", "path": "lastCompare.lamport", "value": ">"}]}, "label": "反过来比较：work → recv(m2)"}
+      ]
+    },
+    {
+      "id": "concurrent-equal",
+      "name": "逻辑时钟 · 并发事件的 Lamport 值相等",
+      "settings": {"nodeCount": 3, "latency": 300},
+      "description": "三个节点各自发生一个本地事件，Lamport 值都是 1：L 相等必为并发，全序 L.id 用节点编号任意打破平局。之后一条消息建立因果关系。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Local", "values": {"label": "x"}}},
+        {"input": {"node": "node-2", "method": "Application.Local", "values": {"label": "y"}}},
+        {"input": {"node": "node-3", "method": "Application.Local", "values": {"label": "z"}}},
+        {"check": {"node": "*", "path": "lamport", "value": 1}, "label": "三个事件的 L 都是 1"},
+        {"input": {"node": "node-2", "method": "Application.Compare", "values": {"a": "node-2:1", "b": "node-1:1"}}},
+        {"check": {"all": [{"node": "node-2", "path": "lastCompare.lamport", "value": "="}, {"node": "node-2", "path": "lastCompare.vector", "value": "concurrent"}, {"node": "node-2", "path": "lastCompare.total", "value": "1.2 > 1.1"}]}, "label": "L 相等 ⇒ 并发；全序中 1.1 排在 1.2 前"},
+        {"input": {"node": "node-1", "method": "Application.Send", "values": {"to": "node-2", "label": "m"}}},
+        {"until": {"node": "node-2", "path": "eventCount", "value": 2}, "timeout": 10000, "label": "node-2 收到 m"},
+        {"input": {"node": "node-2", "method": "Application.Compare", "values": {"a": "node-1:1", "b": "node-2:2"}}},
+        {"check": {"all": [{"node": "node-2", "path": "lastCompare.vector", "value": "a→b"}, {"node": "node-2", "path": "lastCompare.La", "value": 1}, {"node": "node-2", "path": "lastCompare.Lb", "value": 3}]}, "label": "x → recv(m)：L 从 1 到 max(1,2)+1=3"},
+        {"input": {"node": "node-3", "method": "Application.Compare", "values": {"a": "node-3:1", "b": "node-2:2"}}},
+        {"check": {"all": [{"node": "node-3", "path": "lastCompare.lamportLess", "value": true}, {"node": "node-3", "path": "lastCompare.vector", "value": "concurrent"}]}, "label": "z 与 recv(m)：L(z)<L 却仍是并发"}
+      ]
+    },
+    {
+      "id": "auto-random",
+      "name": "逻辑时钟 · 随机事件后再比较",
+      "settings": {"nodeCount": 4, "latency": 200},
+      "description": "4 个节点随机产生本地事件和消息，填满时空图；停下后比较几对事件：有因果关系时 Lamport 顺序一定与之一致，没有时 Lamport 顺序只是任意的。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Auto", "values": {"enabled": true, "intervalMs": 800}}},
+        {"input": {"node": "node-2", "method": "Application.Auto", "values": {"enabled": true, "intervalMs": 800}}},
+        {"input": {"node": "node-3", "method": "Application.Auto", "values": {"enabled": true, "intervalMs": 800}}},
+        {"input": {"node": "node-4", "method": "Application.Auto", "values": {"enabled": true, "intervalMs": 800}}},
+        {"until": {"node": "*", "path": "eventCount", "op": ">=", "value": 8}, "timeout": 30000, "label": "每个节点至少 8 个事件"},
+        {"input": {"node": "node-1", "method": "Application.Auto", "values": {"enabled": false}}},
+        {"input": {"node": "node-2", "method": "Application.Auto", "values": {"enabled": false}}},
+        {"input": {"node": "node-3", "method": "Application.Auto", "values": {"enabled": false}}},
+        {"input": {"node": "node-4", "method": "Application.Auto", "values": {"enabled": false}}},
+        {"wait": 2000},
+        {"input": {"node": "node-1", "method": "Application.Compare", "values": {"a": "node-1:2", "b": "node-1:6"}}},
+        {"check": {"all": [{"node": "node-1", "path": "lastCompare.vector", "value": "a→b"}, {"node": "node-1", "path": "lastCompare.lamportLess", "value": true}]}, "label": "同一进程内的事件：a→b 且 L(a)<L(b)"},
+        {"input": {"node": "node-2", "method": "Application.Compare", "values": {"a": "node-3:3", "b": "node-4:6"}}},
+        {"check": {"any": [{"node": "node-2", "path": "lastCompare.vector", "value": "concurrent"}, {"node": "node-2", "path": "lastCompare.agrees", "value": true}]}, "label": "node-3:3 与 node-4:6：有因果则 L 顺序一致，否则并发"},
+        {"input": {"node": "node-3", "method": "Application.Compare", "values": {"a": "node-1:1", "b": "node-2:8"}}},
+        {"check": {"any": [{"node": "node-3", "path": "lastCompare.vector", "value": "concurrent"}, {"node": "node-3", "path": "lastCompare.agrees", "value": true}]}, "label": "node-1:1 与 node-2:8：时钟条件成立"},
+        {"input": {"node": "node-4", "method": "Application.Compare", "values": {"a": "node-4:8", "b": "node-1:8"}}},
+        {"check": {"any": [{"node": "node-4", "path": "lastCompare.vector", "value": "concurrent"}, {"node": "node-4", "path": "lastCompare.agrees", "value": true}]}, "label": "node-4:8 与 node-1:8：时钟条件成立"}
+      ]
+    }
+  ]
+}

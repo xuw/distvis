@@ -1,0 +1,64 @@
+{
+  "scenarios": [
+    {
+      "id": "async-stale",
+      "name": "主备 · 异步复制下的过期读与会话读",
+      "settings": {"nodeCount": 3, "latency": 150},
+      "description": "异步复制且备份延迟 4 秒收到更新：客户端经 node-2 写入后立刻在 node-2 本地读，读到旧值（不满足线性一致性）；转发到主副本读得到新值；带上写入返回的 index 做会话读，会等日志追上后再返回。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Mode", "values": {"mode": "async", "replicationDelayMs": 4000}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "mode", "value": "async"}, "timeout": 5000, "label": "三个节点都切到 async"},
+        {"input": {"node": "node-2", "method": "Application.Put", "values": {"key": "x", "value": "1"}}, "expect": "ok"},
+        {"input": {"node": "node-2", "method": "Application.Get", "values": {"key": "x", "mode": "local"}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-2", "path": "lastRead.found", "value": false}, {"node": "node-2", "path": "lastRead.stale", "value": true}]}, "label": "node-2 本地读：写已返回却读不到 x（过期读）"},
+        {"check": {"node": "node-1", "path": "store.x", "value": "1"}, "label": "主副本已经有 x=1"},
+        {"input": {"node": "node-2", "method": "Application.Get", "values": {"key": "x", "mode": "primary"}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-2", "path": "lastRead.value", "value": "1"}, {"node": "node-2", "path": "lastRead.stale", "value": false}]}, "label": "转发到主副本读：读到最新值"},
+        {"input": {"node": "node-3", "method": "Application.Put", "values": {"key": "x", "value": "2"}}, "expect": "ok"},
+        {"input": {"node": "node-3", "method": "Application.Get", "values": {"key": "x", "mode": "session", "minIndex": 2}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-3", "path": "lastRead.value", "value": "2"}, {"node": "node-3", "path": "lastRead.waitedMs", "op": ">=", "value": 1500}]}, "label": "会话读等本地日志追上 index 2 后读到自己的写"},
+        {"until": {"all": [{"node": "*", "path": "appliedIndex", "value": 2}, {"same": "store"}]}, "timeout": 10000, "label": "备份最终追上（最终一致）"}
+      ]
+    },
+    {
+      "id": "sync-blocks",
+      "name": "主备 · 同步复制与备份崩溃",
+      "settings": {"nodeCount": 3, "latency": 150},
+      "description": "同步复制时写入要等所有备份确认，因此写返回后任何副本本地读都是新值；但一个备份崩溃后，写入无法得到全部确认而超时失败——一致性的代价是可用性。恢复后备份从断点追上日志。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Mode", "values": {"mode": "sync"}}, "expect": "ok"},
+        {"input": {"node": "node-3", "method": "Application.Put", "values": {"key": "x", "value": "1"}}, "expect": "ok"},
+        {"input": {"node": "node-2", "method": "Application.Get", "values": {"key": "x", "mode": "local"}}, "expect": "ok"},
+        {"check": {"node": "node-2", "path": "lastRead.value", "value": "1"}, "label": "写返回后，备份本地读就是新值"},
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"wait": 1000},
+        {"input": {"node": "node-2", "method": "Application.Put", "values": {"key": "x", "value": "2"}}, "expect": "error", "timeout": 12000},
+        {"check": {"all": [{"node": "node-1", "path": "store.x", "value": "2"}, {"node": "node-2", "path": "store.x", "value": "2"}]}, "label": "主副本和存活备份已应用，但客户端得到的是失败"},
+        {"check": {"node": "node-1", "path": "acked.node-3", "value": 1}, "label": "node-3 只确认到 index 1"},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"all": [{"node": "node-3", "path": "appliedIndex", "value": 2}, {"node": "node-3", "path": "store.x", "value": "2"}]}, "timeout": 30000, "label": "node-3 恢复后从 index 2 追上"},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "y", "value": "3"}}, "expect": "ok"},
+        {"check": {"same": "store"}, "label": "恢复后同步写入再次可用，三个副本一致"}
+      ]
+    },
+    {
+      "id": "partition",
+      "name": "主备 · 备份被分区",
+      "settings": {"nodeCount": 3, "latency": 150},
+      "description": "异步复制下 node-3 与主副本之间断网：主副本继续接受写入（可用），node-3 本地读返回旧值；node-3 上的会话读等不到日志、写入也无法转发，都失败。网络恢复后 node-3 追上。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Mode", "values": {"mode": "async", "replicationDelayMs": 0}}, "expect": "ok"},
+        {"until": {"node": "node-3", "path": "mode", "value": "async"}, "timeout": 5000, "label": "node-3 收到模式设置"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-3", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-2", "method": "Application.Put", "values": {"key": "x", "value": "1"}}, "expect": "ok"},
+        {"until": {"node": "node-2", "path": "store.x", "value": "1"}, "timeout": 5000, "label": "node-2 收到更新"},
+        {"input": {"node": "node-3", "method": "Application.Get", "values": {"key": "x", "mode": "local"}}, "expect": "ok"},
+        {"check": {"node": "node-3", "path": "lastRead.found", "value": false}, "label": "node-3 本地读：旧值（它甚至不知道自己过期）"},
+        {"input": {"node": "node-3", "method": "Application.Get", "values": {"key": "x", "mode": "session", "minIndex": 1}}, "expect": "error", "timeout": 12000},
+        {"input": {"node": "node-3", "method": "Application.Put", "values": {"key": "x", "value": "9"}}, "expect": "error", "timeout": 12000},
+        {"fault": {"kind": "heal"}},
+        {"until": {"all": [{"node": "node-3", "path": "appliedIndex", "value": 1}, {"same": "store"}]}, "timeout": 15000, "label": "网络恢复后 node-3 追上"}
+      ]
+    }
+  ]
+}

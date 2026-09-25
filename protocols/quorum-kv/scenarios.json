@@ -1,0 +1,76 @@
+{
+  "scenarios": [
+    {
+      "id": "slow-replica",
+      "name": "Quorum · 避开最慢的副本",
+      "settings": {"nodeCount": 5, "latency": 100},
+      "description": "N=5、W=3、R=3，node-1 到 node-5 的链路延迟 3 秒。写和读在 3 个快副本回复后就返回，慢副本在后台稍后收到；改成 W=5 后，每次写都要等最慢的副本。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.SetQuorum", "values": {"w": 3, "r": 3}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "w", "value": 3}, "timeout": 5000, "label": "所有协调者使用 W=3、R=3"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "latency": 3000}},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "x", "value": "1"}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-1", "path": "lastPut.ms", "op": "<", "value": 1500}, {"not": {"node": "node-1", "path": "lastPut.acks", "op": "includes", "value": "node-5"}}]}, "label": "写在法定人数确认后返回，不等 node-5"},
+        {"check": {"node": "node-5", "path": "store.x", "op": "missing"}, "label": "此时 node-5 还没收到 x"},
+        {"input": {"node": "node-1", "method": "Application.Get", "values": {"key": "x"}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-1", "path": "lastGet.value", "value": "1"}, {"node": "node-1", "path": "lastGet.ms", "op": "<", "value": 1500}]}, "label": "读也按快副本的速度完成，且读到 x=1"},
+        {"until": {"node": "node-5", "path": "store.x.value", "value": "1"}, "timeout": 8000, "label": "慢副本最终也收到写入"},
+        {"input": {"node": "node-1", "method": "Application.SetQuorum", "values": {"w": 5, "r": 1}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "w", "value": 5}, "timeout": 5000, "label": "改为 W=5、R=1"},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "y", "value": "2"}}, "expect": "ok"},
+        {"check": {"node": "node-1", "path": "lastPut.ms", "op": ">=", "value": 2900}, "label": "W=N：每次写都要等最慢的副本"}
+      ]
+    },
+    {
+      "id": "weak-quorum",
+      "name": "Quorum · W+R≤N 读到旧值",
+      "settings": {"nodeCount": 3, "latency": 100},
+      "description": "N=3、W=1、R=1，node-1→node-3 的链路断开。node-1 写入立即返回，node-3 只读自己，读到旧值（事后发现 stale）。改成 W=2、R=2（W+R>N）后，读写法定人数必然相交，node-3 读到新值，读修复把新值补回 node-3。",
+      "steps": [
+        {"input": {"node": "node-2", "method": "Application.SetQuorum", "values": {"w": 1, "r": 1}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "overlap", "value": false}, "timeout": 5000, "label": "W+R=2≤N=3"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-3", "blocked": true}},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "x", "value": "1"}}, "expect": "ok"},
+        {"until": {"node": "node-2", "path": "store.x.value", "value": "1"}, "timeout": 5000, "label": "node-2 收到写入，node-3 收不到"},
+        {"input": {"node": "node-3", "method": "Application.Get", "values": {"key": "x"}}, "expect": "ok"},
+        {"check": {"node": "node-3", "path": "lastGet.found", "value": false}, "label": "R=1：node-3 只问了自己，读不到已成功的写"},
+        {"until": {"node": "node-3", "path": "lastGet.stale", "value": true}, "timeout": 12000, "label": "迟到的 node-2 回复表明这是过期读"},
+        {"input": {"node": "node-2", "method": "Application.SetQuorum", "values": {"w": 2, "r": 2, "readRepair": true}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "overlap", "value": true}, "timeout": 5000, "label": "W+R=4>N=3"},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "x", "value": "2"}}, "expect": "ok"},
+        {"input": {"node": "node-3", "method": "Application.Get", "values": {"key": "x"}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-3", "path": "lastGet.value", "value": "2"}, {"node": "node-3", "path": "lastGet.from", "op": "includes", "value": "node-2"}]}, "label": "读法定人数包含 node-2，读到最新值"},
+        {"until": {"node": "node-3", "path": "store.x.value", "value": "2"}, "timeout": 10000, "label": "读修复把新值写回 node-3"}
+      ]
+    },
+    {
+      "id": "partition",
+      "name": "Quorum · 网络分区（CP）",
+      "settings": {"nodeCount": 5, "latency": 100},
+      "description": "W=3、R=3，分区 {1,2} | {3,4,5}。少数派既不能写也不能读（一致但不可用），多数派照常读写；失败的写会残留在少数派副本上，但分区恢复后任一读法定人数都与多数派相交，读到的是多数派写入的新值。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.SetQuorum", "values": {"w": 3, "r": 3}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "w", "value": 3}, "timeout": 5000, "label": "W=3、R=3"},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "x", "value": "1"}}, "expect": "ok"},
+        {"until": {"node": "*", "path": "store.x.value", "value": "1"}, "timeout": 5000, "label": "五个副本都有 x=1"},
+        {"note": "分区 {node-1,node-2} | {node-3,node-4,node-5}"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-3", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-2", "to": "node-3", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-2", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-2", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-1", "method": "Application.Put", "values": {"key": "x", "value": "2"}}, "expect": "error", "timeout": 10000},
+        {"input": {"node": "node-2", "method": "Application.Get", "values": {"key": "x"}}, "expect": "error", "timeout": 10000},
+        {"input": {"node": "node-4", "method": "Application.Put", "values": {"key": "x", "value": "3"}}, "expect": "ok"},
+        {"input": {"node": "node-5", "method": "Application.Get", "values": {"key": "x"}}, "expect": "ok"},
+        {"check": {"node": "node-5", "path": "lastGet.value", "value": "3"}, "label": "多数派可写可读"},
+        {"check": {"all": [{"node": "node-1", "path": "store.x.value", "value": "2"}, {"node": "node-2", "path": "store.x.value", "value": "2"}]}, "label": "失败的写残留在少数派副本上"},
+        {"fault": {"kind": "heal"}},
+        {"input": {"node": "node-1", "method": "Application.Get", "values": {"key": "x"}}, "expect": "ok"},
+        {"input": {"node": "node-2", "method": "Application.Get", "values": {"key": "x"}}, "expect": "ok"},
+        {"check": {"all": [{"node": "node-1", "path": "lastGet.value", "value": "3"}, {"node": "node-2", "path": "lastGet.value", "value": "3"}]}, "label": "恢复后读法定人数必含多数派副本：读到 x=3"}
+      ]
+    }
+  ]
+}

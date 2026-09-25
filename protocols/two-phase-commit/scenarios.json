@@ -1,0 +1,86 @@
+{
+  "scenarios": [
+    {
+      "id": "commit",
+      "name": "2PC · 转账成功提交",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "node-2、node-3 各有余额 100。node-1 协调两笔转账：Prepare 投票全部同意后写提交记录再通知，余额移动且总额守恒。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 30}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-1", "path": "txns.T1", "value": "committed"}, {"node": "node-2", "path": "balance", "value": 70}, {"node": "node-3", "path": "balance", "value": 130}]}, "timeout": 10000, "label": "T1 提交：node-2=70、node-3=130（总额 200）"},
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-3", "to": "node-2", "amount": 50}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-2", "path": "balance", "value": 120}, {"node": "node-3", "path": "balance", "value": 80}, {"node": ["node-2", "node-3"], "path": "locked", "value": ""}]}, "timeout": 10000, "label": "T2 提交：node-2=120、node-3=80，锁已释放"},
+        {"check": {"same": "txns", "nodes": ["node-1", "node-2", "node-3"]}, "label": "协调者和参与者对每个事务的结局一致"},
+        {"check": {"messages": {"method": "RM.Prepare", "op": "==", "value": 4}}, "label": "每个事务向两个参与者各发一次 Prepare"},
+        {"check": {"messages": {"method": "RM.Commit", "op": "==", "value": 4}}, "label": "以及一次 Commit"}
+      ]
+    },
+    {
+      "id": "veto",
+      "name": "2PC · 任一参与者否决即中止",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "node-2 余额不足以转出 150，投 NO；即使 node-3 投了 YES，事务也中止。随后 node-3 被设置为强制否决，一笔合法转账同样中止。多数同意不够，必须全体同意。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 150}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-1", "path": "txns.T1", "value": "aborted"}, {"node": "node-3", "path": "txns.T1", "value": "aborted"}, {"node": "node-3", "path": "role", "value": "idle"}]}, "timeout": 10000, "label": "T1 中止，node-3 释放了锁"},
+        {"check": {"all": [{"node": "node-1", "path": "lastTxn.votes.node-2", "value": "no"}, {"node": "node-1", "path": "lastTxn.votes.node-3", "value": "yes"}]}, "label": "node-2 否决（余额不足），node-3 同意"},
+        {"input": {"node": "node-3", "method": "Application.SetVote", "values": {"policy": "no"}}, "expect": "ok"},
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 10}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-1", "path": "txns.T2", "value": "aborted"}, {"node": "node-2", "path": "txns.T2", "value": "aborted"}, {"node": "node-2", "path": "role", "value": "idle"}]}, "timeout": 10000, "label": "T2 被 node-3 否决而中止"},
+        {"check": {"all": [{"node": "node-2", "path": "balance", "value": 100}, {"node": "node-3", "path": "balance", "value": 100}]}, "label": "余额都没有变化"}
+      ]
+    },
+    {
+      "id": "participant-crash",
+      "name": "2PC · 参与者投票前崩溃",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "node-3 崩溃，收不到 Prepare；协调者等投票超时后中止，node-2 释放锁。node-3 恢复后没有该事务的任何记录，新的转账照常提交。",
+      "steps": [
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 30}}, "expect": "ok"},
+        {"until": {"node": "node-2", "path": "role", "value": "prepared"}, "timeout": 5000, "label": "node-2 投 YES 并锁住账户"},
+        {"until": {"all": [{"node": "node-1", "path": "txns.T1", "value": "aborted"}, {"node": "node-1", "path": "lastTxn.votes.node-3", "value": "timeout"}]}, "timeout": 10000, "label": "等 node-3 投票超时，协调者中止"},
+        {"until": {"all": [{"node": "node-2", "path": "role", "value": "idle"}, {"node": "node-2", "path": "balance", "value": 100}]}, "timeout": 8000, "label": "node-2 收到 Abort，释放锁"},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"node": "node-3", "path": "balance", "value": 100}, "timeout": 20000, "label": "node-3 恢复"},
+        {"check": {"node": "node-3", "path": "txns.T1", "op": "missing"}, "label": "node-3 从未见过 T1"},
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 30}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-2", "path": "balance", "value": 70}, {"node": "node-3", "path": "balance", "value": 130}]}, "timeout": 10000, "label": "T2 正常提交"}
+      ]
+    },
+    {
+      "id": "coordinator-crash-blocks",
+      "name": "2PC · 协调者在决定前崩溃（阻塞）",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "两个参与者都投了 YES，协调者在写下决定之前崩溃。参与者已 prepared，不能自行提交或中止，只能持锁等待（uncertain）。协调者恢复后日志里没有决定，按推定中止处理，参与者释放锁。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 30, "pauseBeforeDecisionMs": 30000}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-1", "path": "lastTxn.votes.node-2", "value": "yes"}, {"node": "node-1", "path": "lastTxn.votes.node-3", "value": "yes"}]}, "timeout": 5000, "label": "两个参与者都投了 YES"},
+        {"fault": {"kind": "crash", "node": "node-1"}},
+        {"wait": 8000},
+        {"check": {"all": [{"node": "node-2", "path": "role", "value": "uncertain"}, {"node": "node-3", "path": "role", "value": "uncertain"}, {"node": "node-2", "path": "locked", "value": "T1"}, {"node": "node-3", "path": "locked", "value": "T1"}]}, "label": "8 秒后参与者仍持锁、结局未知"},
+        {"check": {"messages": {"method": "TM.Status", "op": ">=", "value": 4}}, "label": "参与者反复询问协调者"},
+        {"check": {"all": [{"node": "node-2", "path": "balance", "value": 100}, {"node": "node-3", "path": "balance", "value": 100}]}, "label": "余额未动"},
+        {"fault": {"kind": "recover", "node": "node-1"}},
+        {"until": {"all": [{"node": "node-1", "path": "txns.T1", "value": "aborted"}, {"node": "node-2", "path": "role", "value": "idle"}, {"node": "node-3", "path": "role", "value": "idle"}]}, "timeout": 30000, "label": "协调者恢复：无决定记录 → 中止，锁释放"},
+        {"check": {"all": [{"node": "node-2", "path": "txns.T1", "value": "aborted"}, {"node": "node-3", "path": "txns.T1", "value": "aborted"}, {"node": "node-2", "path": "balance", "value": 100}]}, "label": "所有人都中止 T1"}
+      ]
+    },
+    {
+      "id": "coordinator-crash-after-commit",
+      "name": "2PC · 协调者在提交点之后崩溃",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "协调者把 commit 写入日志（提交点）后、通知参与者之前崩溃。事务已经提交，但参与者还不知道，只能等待；协调者恢复后读日志重发 Commit。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Transfer", "values": {"from": "node-2", "to": "node-3", "amount": 30, "pauseAfterDecisionMs": 30000}}, "expect": "ok"},
+        {"until": {"node": "node-1", "path": "txns.T1", "value": "committed"}, "timeout": 5000, "label": "协调者写下 commit 记录"},
+        {"fault": {"kind": "crash", "node": "node-1"}},
+        {"wait": 6000},
+        {"check": {"all": [{"node": "node-2", "path": "role", "value": "uncertain"}, {"node": "node-3", "path": "role", "value": "uncertain"}, {"node": "node-2", "path": "balance", "value": 100}]}, "label": "已提交，但参与者不知道，仍持锁"},
+        {"fault": {"kind": "recover", "node": "node-1"}},
+        {"until": {"all": [{"node": "node-2", "path": "balance", "value": 70}, {"node": "node-3", "path": "balance", "value": 130}, {"node": "node-2", "path": "role", "value": "idle"}, {"node": "node-3", "path": "role", "value": "idle"}]}, "timeout": 30000, "label": "恢复后完成提交：node-2=70、node-3=130"},
+        {"check": {"node": "node-1", "path": "txns.T1", "value": "committed"}, "label": "协调者日志中的决定没有改变"}
+      ]
+    }
+  ]
+}

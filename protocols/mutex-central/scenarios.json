@@ -1,0 +1,89 @@
+{
+  "scenarios": [
+    {
+      "id": "fifo",
+      "name": "集中式 · FIFO 排队与每轮 3 条消息",
+      "settings": {"nodeCount": 5, "latency": 200},
+      "description": "node-4 持锁时 node-2、node-5、node-3 依次申请；协调者按到达顺序（而非节点编号）授予，每轮恰好 Request+Grant+Release 3 条消息。",
+      "steps": [
+        {"input": {"node": "node-4", "method": "Application.Acquire", "values": {"holdMs": 3000}}},
+        {"until": {"node": "node-4", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-4 获得锁"},
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 1500}}},
+        {"wait": 300},
+        {"input": {"node": "node-5", "method": "Application.Acquire", "values": {"holdMs": 1500}}},
+        {"wait": 300},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 1500}}},
+        {"until": {"node": "node-1", "path": "queue", "value": ["node-2", "node-5", "node-3"]}, "timeout": 5000, "label": "协调者队列按到达顺序 [2,5,3]"},
+        {"check": {"node": ["node-2", "node-3", "node-5"], "path": "role", "value": "wanted"}, "label": "排队的客户端都在等待"},
+        {"until": {"node": ["node-2", "node-3", "node-4", "node-5"], "path": "entries", "value": 1}, "timeout": 30000, "label": "4 个客户端都进入过一次"},
+        {"check": {"node": "node-1", "path": "grantOrder", "value": ["node-4", "node-2", "node-5", "node-3"]}, "label": "授予顺序 = 到达顺序（FIFO 公平）"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "任意时刻至多一个 critical"},
+        {"until": {"all": [
+          {"node": "node-1", "path": "holder", "value": ""},
+          {"messages": {"method": "Coord.Request", "op": "==", "value": 4}},
+          {"messages": {"method": "Client.Grant", "op": "==", "value": 4}},
+          {"messages": {"method": "Coord.Release", "op": "==", "value": 4}}
+        ]}, "timeout": 8000, "label": "锁空闲后：4 轮共 4 Request + 4 Grant + 4 Release"}
+      ]
+    },
+    {
+      "id": "crash-blocks",
+      "name": "集中式 · 协调者崩溃使等待者阻塞",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "协调者开启持久化。node-3 排队时协调者崩溃：node-2 的 Release 无法送达，node-3 一直等下去；协调者恢复并读回队列后 node-3 才进入。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 3000}}},
+        {"until": {"node": "node-2", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-2 获得锁"},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 2000}}},
+        {"until": {"node": "node-1", "path": "queue", "value": ["node-3"]}, "timeout": 5000, "label": "node-3 在协调者队列中"},
+        {"fault": {"kind": "crash", "node": "node-1"}},
+        {"wait": 8000},
+        {"check": {"all": [{"node": "node-2", "path": "role", "value": "released"}, {"node": "node-3", "path": "role", "value": "wanted"}]}, "label": "node-2 已离开，但 node-3 仍在等待（锁空闲却无人授予）"},
+        {"fault": {"kind": "recover", "node": "node-1"}},
+        {"until": {"node": "node-3", "path": "entries", "value": 1}, "timeout": 40000, "label": "协调者恢复后 node-3 进入"},
+        {"check": {"node": "node-1", "path": "bootState", "value": "restored"}, "label": "协调者从磁盘读回持有者和队列"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "互斥始终成立"}
+      ]
+    },
+    {
+      "id": "reboot-amnesia",
+      "name": "集中式 · 协调者重启失忆导致两人同时持锁",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "状态只在内存中。node-2 持锁期间协调者崩溃并重启，忘记了持有者；node-3 申请立刻得到 Grant，两个节点同时处于临界区。",
+      "steps": [
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 45000}}},
+        {"until": {"node": "node-2", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-2 获得锁（长时间持有）"},
+        {"fault": {"kind": "crash", "node": "node-1"}},
+        {"wait": 2000},
+        {"fault": {"kind": "recover", "node": "node-1"}},
+        {"until": {"node": "node-1", "path": "holder", "value": ""}, "timeout": 30000, "label": "重启后的协调者认为锁空闲"},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 3000}}},
+        {"until": {"node": "node-3", "path": "role", "value": "critical"}, "timeout": 15000, "label": "node-3 也拿到了锁"},
+        {"check": {"node": "node-2", "path": "role", "value": "critical"}, "label": "node-2 仍在临界区"},
+        {"check": {"moreThanOne": {"path": "role", "value": "critical"}}, "label": "违反互斥：曾有两个 critical"}
+      ]
+    },
+    {
+      "id": "reboot-persist",
+      "name": "集中式 · 持久化后重启仍然安全",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "同上一场景，但协调者先开启 Persist：每次变更用 sdk.Save 落盘。重启后读回持有者 node-2，node-3 只能排队，直到 node-2 释放。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 15000}}},
+        {"until": {"node": "node-2", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-2 获得锁"},
+        {"fault": {"kind": "crash", "node": "node-1"}},
+        {"wait": 2000},
+        {"fault": {"kind": "recover", "node": "node-1"}},
+        {"until": {"node": "node-1", "path": "bootState", "value": "restored"}, "timeout": 30000, "label": "协调者从磁盘恢复"},
+        {"check": {"node": "node-1", "path": "holder", "value": "node-2"}, "label": "恢复后仍知道持有者是 node-2"},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 2000}}},
+        {"until": {"node": "node-1", "path": "queue", "value": ["node-3"]}, "timeout": 10000, "label": "node-3 进入队列而不是拿到锁"},
+        {"check": {"node": "node-3", "path": "role", "value": "wanted"}, "label": "node-3 在等待"},
+        {"until": {"node": "node-3", "path": "entries", "value": 1}, "timeout": 30000, "label": "node-2 释放后 node-3 进入"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "互斥始终成立"}
+      ]
+    }
+  ]
+}

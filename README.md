@@ -1,6 +1,6 @@
 # DistVis
 
-用户开发文档：[Go API](docs/GO-API.md) · [平台 HTTP API](docs/PLATFORM-API.md) · [Agent / MCP / skill](docs/AGENT.md)。启动平台后，从侧栏「API 文档」打开（可视化页面中侧栏收起为导航抽屉，点击左上角 ☰ 打开）；也可直接访问 [/docs/go](http://localhost:3000/docs/go) 和 [/docs/platform](http://localhost:3000/docs/platform)，支持搜索、目录跳转、代码复制和 Markdown 下载。
+用户开发文档：[Go API](docs/GO-API.md) · [平台 HTTP API](docs/PLATFORM-API.md) · [Agent / MCP / skill](docs/AGENT.md) · [课程协议与观察场景 L05–L07](docs/LECTURES.md)。启动平台后，从侧栏「API 文档」打开（可视化页面中侧栏收起为导航抽屉，点击左上角 ☰ 打开）；也可直接访问 [/docs/go](http://localhost:3000/docs/go) 和 [/docs/platform](http://localhost:3000/docs/platform)，支持搜索、目录跳转、代码复制和 Markdown 下载。
 
 文档示例验收：`node tests/docs-container-smoke.mjs` 在空闲平台运行原样下载的 Ping 程序，记录自动归档；`node tests/browser-docs-smoke.mjs` 检查文档导航、搜索、复制和移动布局（需 Playwright）。平台 API 文档中的 `demo.mjs` 可直接执行完整的创建、输入、故障和导出流程。
 

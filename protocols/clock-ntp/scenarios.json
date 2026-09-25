@@ -1,0 +1,72 @@
+{
+  "scenarios": [
+    {
+      "id": "proc-delay",
+      "name": "NTP · 服务器处理时间被扣除",
+      "settings": {"nodeCount": 3, "latency": 100},
+      "description": "与 Cristian 的 server-delay 场景相同：服务器每个请求处理 1000ms。NTP 用 t1、t2 量出处理时间并从 delay 中扣除，客户端误差仍在几十毫秒以内（Cristian 是 +500ms）。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.SetServer", "values": {"delayMs": 1000, "jitterMs": 0}}, "expect": "ok"},
+        {"input": {"node": "node-2", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-2", "path": "lastSync.serverProcMs", "op": ">=", "value": 950}, "label": "t2 − t1 量出服务器处理时间 ≈ 1000ms"},
+        {"check": {"node": "node-2", "path": "lastSync.delayMs", "op": "<=", "value": 300}, "label": "delay = (t3−t0) − (t2−t1) 只剩网络往返 ≈ 200ms"},
+        {"check": {"node": "node-2", "path": "lastSync.errorAfterMs", "op": "abs<=", "value": 45}, "label": "同步后误差 ≤ 45ms：处理时间不影响 NTP"},
+        {"check": {"node": "node-2", "path": "lastSync.withinBound", "value": true}, "label": "误差在 ±delay/2 之内"}
+      ]
+    },
+    {
+      "id": "jitter-filter",
+      "name": "NTP · 网络抖动与最小 delay 过滤",
+      "settings": {"nodeCount": 3, "latency": 50},
+      "description": "node-1 的两个方向都加 0..800ms 的随机排队延迟。单个样本的偏移估计误差平均约 100ms；每轮 8 个样本取 delay 最小者，平均误差只有二三十毫秒。node-2 的漂移设为 0，只观察抖动。",
+      "steps": [
+        {"input": {"node": "node-2", "method": "Application.SetClock", "values": {"offsetMs": 1500, "driftMsPerSec": 0}}, "expect": "ok"},
+        {"input": {"node": "node-1", "method": "Application.SetServer", "values": {"delayMs": 0, "jitterMs": 800}}, "expect": "ok"},
+        {"input": {"node": "node-2", "method": "Application.AutoSync", "values": {"periodMs": 1000}}, "expect": "ok"},
+        {"until": {"node": "node-2", "path": "bursts", "op": ">=", "value": 10}, "timeout": 60000, "label": "完成 10 轮（80 个样本）"},
+        {"input": {"node": "node-2", "method": "Application.AutoSync", "values": {"periodMs": 0}}, "expect": "ok"},
+        {"check": {"node": "node-2", "path": "avgSampleErrMs", "op": ">=", "value": 75}, "label": "若只用单个样本：平均误差 ≥ 75ms"},
+        {"check": {"node": "node-2", "path": "avgErrMs", "op": "<=", "value": 65}, "label": "取最小 delay 样本：平均误差 ≤ 65ms"},
+        {"check": {"node": "node-2", "path": "lastSync.withinBound", "value": true}, "label": "选中样本的误差在 ±delay/2 之内"}
+      ]
+    },
+    {
+      "id": "asymmetric",
+      "name": "NTP · 非对称链路仍有误差",
+      "settings": {"nodeCount": 3, "latency": 100},
+      "description": "node-2→node-1 方向延迟 700ms。8 个样本彼此一致（没有抖动），但都偏 (700−100)/2 = +300ms：NTP 与 Cristian 一样假设两个方向延迟相等，多次测量无法消除固定的不对称。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-2", "to": "node-1", "latency": 700}},
+        {"input": {"node": "node-2", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"input": {"node": "node-3", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-2", "path": "lastSync.delayMs", "op": ">=", "value": 750}, "label": "delay ≈ 700 + 100"},
+        {"check": {"all": [{"node": "node-2", "path": "lastSync.errorAfterMs", "op": ">=", "value": 250}, {"node": "node-2", "path": "lastSync.errorAfterMs", "op": "<=", "value": 350}]}, "label": "node-2 同步后仍快 ≈ 300ms"},
+        {"check": {"node": "node-2", "path": "lastSync.sampleSpreadMs", "op": "<=", "value": 60}, "label": "8 个样本几乎一致：误差是系统性的，过滤无效"},
+        {"check": {"node": "node-2", "path": "lastSync.withinBound", "value": true}, "label": "误差仍在 ±delay/2 之内"},
+        {"check": {"node": "node-3", "path": "lastSync.errorAfterMs", "op": "abs<=", "value": 45}, "label": "对称链路上的 node-3 误差很小"}
+      ]
+    },
+    {
+      "id": "strata",
+      "name": "NTP · 误差随 stratum 累积",
+      "settings": {"nodeCount": 5, "latency": 100},
+      "description": "node-1 为 stratum 1；node-2/3 从 node-1 同步（stratum 2）；node-4/5 从 node-2/3 中 delay 最小者同步（stratum 3）。每一跳的上行方向都慢 200ms（如 ADSL），每跳引入约 +100ms 偏差并逐级累积。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-2", "to": "node-1", "latency": 300}},
+        {"fault": {"kind": "link", "from": "node-3", "to": "node-1", "latency": 300}},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-2", "latency": 300}},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-3", "latency": 300}},
+        {"fault": {"kind": "link", "from": "node-5", "to": "node-2", "latency": 300}},
+        {"fault": {"kind": "link", "from": "node-5", "to": "node-3", "latency": 300}},
+        {"check": {"all": [{"node": "node-1", "path": "stratum", "value": 1}, {"node": ["node-2", "node-3"], "path": "stratum", "value": 2}, {"node": ["node-4", "node-5"], "path": "stratum", "value": 3}]}, "label": "层次：node-1 → node-2/3 → node-4/5"},
+        {"input": {"node": "node-2", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"input": {"node": "node-3", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"input": {"node": "node-4", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"input": {"node": "node-5", "method": "Application.Sync", "values": {}}, "expect": "ok"},
+        {"check": {"node": ["node-4", "node-5"], "path": "lastSync.upstream", "op": "in", "value": ["node-2", "node-3"]}, "label": "stratum 3 从 delay 最小的 stratum 2 上游同步"},
+        {"check": {"all": [{"node": ["node-2", "node-3"], "path": "lastSync.errorAfterMs", "op": ">=", "value": 50}, {"node": ["node-2", "node-3"], "path": "lastSync.errorAfterMs", "op": "<=", "value": 150}]}, "label": "stratum 2 误差 ≈ +100ms（一跳）"},
+        {"check": {"all": [{"node": ["node-4", "node-5"], "path": "lastSync.errorAfterMs", "op": ">=", "value": 140}, {"node": ["node-4", "node-5"], "path": "lastSync.errorAfterMs", "op": "<=", "value": 270}]}, "label": "stratum 3 误差 ≈ +200ms（两跳累积）"}
+      ]
+    }
+  ]
+}

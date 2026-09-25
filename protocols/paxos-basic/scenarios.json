@@ -1,0 +1,159 @@
+{
+  "scenarios": [
+    {
+      "id": "case1-no-prior",
+      "name": "Paxos · 情形1 尚无提案",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "课件 p.33–36：N1 以 P 1.1 联系 N1–N3，得到多数派 Promise 后发送 A 1.1 紫荆，多数派接受即选定。",
+      "steps": [
+        {"note": "N1 只能与 N2、N3 通信（与 N4、N5 的链路被切断），像课件图中那样只联系一个多数派"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆"}}},
+        {"until": {"node": "node-1", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.1 得到 N1–N3 多数派，紫荆被选定"},
+        {"until": {"all": [{"node": "node-1", "path": "chosen", "value": "紫荆"}, {"node": "node-2", "path": "chosen", "value": "紫荆"}, {"node": "node-3", "path": "chosen", "value": "紫荆"}]}, "timeout": 8000, "label": "N1–N3 学到选定值 紫荆"},
+        {"check": {"node": "node-1", "path": "lastProposal.n", "value": "1.1"}, "label": "提案号为 1.1（round 1，节点 1）"},
+        {"check": {"node": "node-1", "path": "lastProposal.promises", "value": "3/5"}, "label": "多数派 3/5 个 Promise 即进入第二阶段"},
+        {"check": {"all": [{"node": "node-4", "path": "promised", "value": ""}, {"node": "node-5", "path": "promised", "value": ""}]}, "label": "N4、N5 没有参与"}
+      ]
+    },
+    {
+      "id": "case2-chosen",
+      "name": "Paxos · 情形2 已有选定值",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "课件 p.37–40：紫荆 已由 N1–N3 选定；N4 以 P 1.4 联系 N3–N5，从 N3 的 Promise 中看到 <A 1.1 紫荆>，只能改提 紫荆。",
+      "steps": [
+        {"note": "N1 只能与 N2、N3 通信（与 N4、N5 的链路被切断），像课件图中那样只联系一个多数派"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆"}}},
+        {"until": {"node": "node-1", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.1 得到 N1–N3 多数派，紫荆被选定"},
+        {"until": {"all": [{"node": "node-1", "path": "chosen", "value": "紫荆"}, {"node": "node-2", "path": "chosen", "value": "紫荆"}, {"node": "node-3", "path": "chosen", "value": "紫荆"}]}, "timeout": 8000, "label": "N1–N3 学到选定值 紫荆"},
+        {"check": {"node": "node-1", "path": "lastProposal.n", "value": "1.1"}, "label": "提案号为 1.1（round 1，节点 1）"},
+        {"check": {"node": "node-1", "path": "lastProposal.promises", "value": "3/5"}, "label": "多数派 3/5 个 Promise 即进入第二阶段"},
+        {"check": {"all": [{"node": "node-4", "path": "promised", "value": ""}, {"node": "node-5", "path": "promised", "value": ""}]}, "label": "N4、N5 没有参与"},
+        {"note": "N4 与 N1、N2 断开，只能联系 N3、N5 组成的多数派"},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-2", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-4", "method": "Application.Propose", "values": {"value": "澜园"}}},
+        {"until": {"node": "node-4", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.4 完成"},
+        {"check": {"node": "node-4", "path": "lastProposal.n", "value": "1.4"}, "label": "N4 没见过 round 1，因此提案号是 1.4 > 1.1"},
+        {"check": {"node": "node-4", "path": "lastProposal.value", "value": "紫荆"}, "label": "N3 的 Promise 带回 <A 1.1 紫荆>，N4 放弃 澜园 改提 紫荆"},
+        {"until": {"same": "chosen"}, "timeout": 8000, "label": "所有节点的 chosen 都是 紫荆"},
+        {"check": {"node": "node-1", "path": "chosen", "value": "紫荆"}, "label": "已选定的值没有改变"}
+      ]
+    },
+    {
+      "id": "case3-seen",
+      "name": "Paxos · 情形3 看到未选定的值",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "课件 p.41–42：A 1.1 紫荆 只被 N1、N3 接受时，N4 发起 P 1.4 并在 N3 处看到它；两个提案都成功，选定同一值 紫荆。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆", "pauseMs": 3000}}},
+        {"until": {"node": "node-1", "path": "lastProposal.phase", "value": "paused"}, "timeout": 15000, "label": "N1 得到多数派 Promise，暂停在两阶段之间"},
+        {"note": "把 N1→N2 的延迟调到 4000ms：Accept 1.1 很晚才到达 N2"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-2", "latency": 4000}},
+        {"until": {"node": "node-3", "path": "accepted", "value": "1.1 紫荆"}, "timeout": 8000, "label": "N3 接受了 A 1.1 紫荆"},
+        {"check": {"node": "node-2", "path": "accepted", "value": ""}, "label": "此时只有 N1、N3 接受：紫荆 尚未被选定"},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-2", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-4", "method": "Application.Propose", "values": {"value": "澜园"}}},
+        {"until": {"node": "node-4", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.4 完成"},
+        {"check": {"node": "node-4", "path": "lastProposal.value", "value": "紫荆"}, "label": "N4 在 N3 处看到未选定的 紫荆，并沿用它"},
+        {"until": {"node": "node-1", "path": "lastProposal.result", "value": "chosen"}, "timeout": 12000, "label": "迟到的 A 1.1 被 N2 接受，N1 的提案也成功"},
+        {"until": {"same": "chosen"}, "timeout": 8000, "label": "两个提案都成功，选定同一个值 紫荆"}
+      ]
+    },
+    {
+      "id": "case4-unseen",
+      "name": "Paxos · 情形4 没看到之前的值",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "课件 p.43–45：A 1.1 紫荆 到达 N3 之前 N3 已承诺 P 1.4；N4 选定自己的 澜园，N1 的迟到 Accept 被拒绝。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆", "pauseMs": 3000}}},
+        {"until": {"node": "node-1", "path": "lastProposal.phase", "value": "paused"}, "timeout": 15000, "label": "N1 得到多数派 Promise，暂停在两阶段之间"},
+        {"note": "把 N1→N3 的延迟调到 4000ms：Accept 1.1 很晚才到达 N3"},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-3", "latency": 4000}},
+        {"until": {"node": "node-2", "path": "accepted", "value": "1.1 紫荆"}, "timeout": 8000, "label": "N1、N2 接受了 A 1.1 紫荆（2/5，未过半）"},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-2", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-4", "method": "Application.Propose", "values": {"value": "澜园"}}},
+        {"until": {"node": "node-4", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.4 完成"},
+        {"check": {"node": "node-4", "path": "lastProposal.value", "value": "澜园"}, "label": "N3、N4、N5 都没接受过值，N4 提自己的 澜园"},
+        {"until": {"node": "node-1", "path": "lastProposal.result", "value": "rejected"}, "timeout": 12000, "label": "迟到的 A 1.1 被 N3 拒绝（已承诺 1.4）"},
+        {"check": {"node": "node-1", "path": "lastProposal.rejectedBy", "value": "1.4"}, "label": "拒绝理由：更高的提案号 1.4"},
+        {"until": {"same": "chosen", "nodes": ["node-3", "node-4", "node-5"]}, "timeout": 8000, "label": "N3–N5 学到 澜园"},
+        {"check": {"node": "node-4", "path": "chosen", "value": "澜园"}, "label": "选定值是 澜园"},
+        {"check": {"all": [{"node": "node-1", "path": "chosen", "value": null, "op": "missing"}, {"node": "node-2", "path": "accepted", "value": "1.1 紫荆"}]}, "label": "N2 仍存着 1.1 紫荆，但它从未被选定"}
+      ]
+    },
+    {
+      "id": "livelock",
+      "name": "Paxos · 活锁与随机退避",
+      "settings": {"nodeCount": 5, "latency": 200},
+      "description": "课件 p.48：两个提案者关闭退避、立即重试，彼此的 Prepare 使对方的 Accept 失效，长时间无法选定；打开随机退避后很快选定。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Backoff", "values": {"enabled": false}}},
+        {"input": {"node": "node-5", "method": "Application.Backoff", "values": {"enabled": false}}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆", "pauseMs": 1500, "retry": true}}},
+        {"wait": 1000},
+        {"input": {"node": "node-5", "method": "Application.Propose", "values": {"value": "桃李", "pauseMs": 1500, "retry": true}}},
+        {"wait": 15000},
+        {"check": {"node": "*", "path": "chosen", "value": null, "op": "missing"}, "label": "15 秒过去，仍没有任何值被选定"},
+        {"check": {"all": [{"node": "node-1", "path": "lastProposal.attempt", "value": 4, "op": ">="}, {"node": "node-5", "path": "lastProposal.attempt", "value": 4, "op": ">="}]}, "label": "两个提案者都已重试多次"},
+        {"check": {"messages": {"method": "Paxos.Prepare", "op": ">=", "value": 24}}, "label": "Prepare 消息不断增加"},
+        {"note": "打开随机退避"},
+        {"input": {"node": "node-1", "method": "Application.Backoff", "values": {"enabled": true}}},
+        {"input": {"node": "node-5", "method": "Application.Backoff", "values": {"enabled": true}}},
+        {"until": {"node": "any", "path": "chosen", "value": null, "op": "exists"}, "timeout": 30000, "label": "随机退避后很快有值被选定"},
+        {"until": {"same": "chosen"}, "timeout": 10000, "label": "所有节点学到同一个值"}
+      ]
+    },
+    {
+      "id": "amnesia",
+      "name": "Paxos · 重启丢失投票（不安全）",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "课件 p.47：N3 不持久化状态；紫荆 被选定后 N3 重启、忘记投票，N4 用 N3–N5 选定了 澜园——两个不同的值都被选定。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-3", "method": "Application.Amnesia", "values": {"enabled": true}}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆"}}},
+        {"until": {"all": [{"node": "node-1", "path": "lastProposal.result", "value": "chosen"}, {"node": "node-3", "path": "accepted", "value": "1.1 紫荆"}]}, "timeout": 15000, "label": "紫荆 由 N1、N2、N3 选定"},
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"wait": 1500},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"node": "node-3", "path": "recovered", "value": true}, "timeout": 30000, "label": "N3 重启完成"},
+        {"check": {"all": [{"node": "node-3", "path": "accepted", "value": ""}, {"node": "node-3", "path": "promised", "value": ""}]}, "label": "N3 忘记了自己的承诺和投票"},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-2", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-4", "method": "Application.Propose", "values": {"value": "澜园"}}},
+        {"until": {"node": "node-4", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.4 完成"},
+        {"check": {"all": [{"node": "node-1", "path": "chosen", "value": "紫荆"}, {"node": "node-4", "path": "chosen", "value": "澜园"}]}, "label": "违反安全性：紫荆 与 澜园 都被“选定”"},
+        {"check": {"differ": "chosen"}, "label": "节点之间 chosen 不一致"}
+      ]
+    },
+    {
+      "id": "reboot-safe",
+      "name": "Paxos · 重启后持久化状态保证安全",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "对照 amnesia：N3 在回复前用 sdk.Save 持久化承诺与投票，重启后仍记得 1.1 紫荆，N4 只能沿用 紫荆。",
+      "steps": [
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-4", "blocked": true, "bidirectional": true}},
+        {"fault": {"kind": "link", "from": "node-1", "to": "node-5", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-1", "method": "Application.Propose", "values": {"value": "紫荆"}}},
+        {"until": {"all": [{"node": "node-1", "path": "lastProposal.result", "value": "chosen"}, {"node": "node-3", "path": "accepted", "value": "1.1 紫荆"}]}, "timeout": 15000, "label": "紫荆 由 N1、N2、N3 选定"},
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"wait": 1500},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"node": "node-3", "path": "recovered", "value": true}, "timeout": 30000, "label": "N3 重启完成"},
+        {"check": {"all": [{"node": "node-3", "path": "accepted", "value": "1.1 紫荆"}, {"node": "node-3", "path": "promised", "value": "1.1"}]}, "label": "N3 从持久化状态恢复承诺和投票"},
+        {"fault": {"kind": "link", "from": "node-4", "to": "node-2", "blocked": true, "bidirectional": true}},
+        {"input": {"node": "node-4", "method": "Application.Propose", "values": {"value": "澜园"}}},
+        {"until": {"node": "node-4", "path": "lastProposal.result", "value": "chosen"}, "timeout": 15000, "label": "P 1.4 完成"},
+        {"check": {"node": "node-4", "path": "lastProposal.value", "value": "紫荆"}, "label": "N4 从 N3 看到 1.1 紫荆 并沿用"},
+        {"until": {"same": "chosen"}, "timeout": 8000, "label": "所有节点一致为 紫荆"}
+      ]
+    }
+  ]
+}

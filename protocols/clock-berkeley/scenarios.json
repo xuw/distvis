@@ -1,0 +1,74 @@
+{
+  "scenarios": [
+    {
+      "id": "converge",
+      "name": "Berkeley · 周期轮次使时钟收敛",
+      "settings": {"nodeCount": 5, "latency": 100},
+      "description": "5 个节点的时钟相差近 4 秒（master 自己也快 0.4s）。master 每 5s 一轮：轮询、求平均、发相对调整量，客户端平滑调整。节点之间的差距缩小到几百毫秒以内，但所有节点一起偏离 UTC 约 +0.6s——没有权威时间源。",
+      "steps": [
+        {"until": {"node": "node-1", "path": "rounds", "op": ">=", "value": 4}, "timeout": 40000, "label": "master 完成 4 轮"},
+        {"check": {"node": "node-1", "path": "spreadHistory.0", "op": ">=", "value": 3000}, "label": "第一轮测得的最大差距 ≥ 3s"},
+        {"check": {"node": "node-1", "path": "spreadMs", "op": "<=", "value": 400}, "label": "几轮之后节点间差距 ≤ 400ms"},
+        {"check": {"node": "node-1", "path": "errorMs", "op": ">=", "value": 300}, "label": "但相对 UTC 的误差并未归零（整体快约 0.6s）"},
+        {"check": {"node": "*", "path": "backwardJumps", "value": 0}, "label": "平滑调整：没有任何时钟倒退"}
+      ]
+    },
+    {
+      "id": "outlier",
+      "name": "Berkeley · 离群时钟不参与平均",
+      "settings": {"nodeCount": 5, "latency": 100},
+      "description": "node-4 的时钟快了 10 秒。它与中位数的差超过阈值 3000ms，被排除在平均值之外（否则平均值会被拉快 2 秒），但仍收到自己的调整量，逐步被拉回来，之后重新参与平均。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.SetPeriod", "values": {"periodMs": 0}}, "expect": "ok"},
+        {"input": {"node": "node-4", "method": "Application.SetClock", "values": {"offsetMs": 10000, "driftMsPerSec": 10}}, "expect": "ok"},
+        {"input": {"node": "node-1", "method": "Application.SyncRound", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-1", "path": "lastRound.node-4.used", "value": false}, "label": "node-4 被判为离群值"},
+        {"check": {"node": "node-1", "path": "avgMs", "op": "abs<=", "value": 600}, "label": "平均值不受离群值影响（|avg| ≤ 600ms，否则约 +1.7s）"},
+        {"check": {"node": "node-1", "path": "lastRound.node-4.adjMs", "op": "<=", "value": -9000}, "label": "node-4 仍收到约 −9.9s 的调整量"},
+        {"input": {"node": "node-1", "method": "Application.SetPeriod", "values": {"periodMs": 5000}}, "expect": "ok"},
+        {"until": {"all": [{"node": "node-1", "path": "lastRound.node-4.used", "value": true}, {"node": "node-1", "path": "spreadMs", "op": "<=", "value": 400}]}, "timeout": 60000, "label": "node-4 被逐步拉回，重新参与平均，全体差距 ≤ 400ms"},
+        {"check": {"node": "node-4", "path": "backwardJumps", "value": 0}, "label": "即使调整近 10 秒，slew 也从不倒退"}
+      ]
+    },
+    {
+      "id": "step-vs-slew",
+      "name": "Berkeley · 跳变 vs 平滑调整",
+      "settings": {"nodeCount": 4, "latency": 100},
+      "description": "先用 slew：调整分几秒完成，时钟只会变快或变慢，从不倒退。再切到 step：快了 3 秒的 node-2 一步跳回去，本地时间倒退（backwardJumps），这正是课件说 “can't just change time” 的原因。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.SetPeriod", "values": {"periodMs": 0}}, "expect": "ok"},
+        {"input": {"node": "node-1", "method": "Application.SyncRound", "values": {}}, "expect": "ok"},
+        {"input": {"node": "node-1", "method": "Application.SyncRound", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-1", "path": "spreadMs", "op": ">=", "value": 1500}, "label": "slew：刚调整后差距仍很大（渐进）"},
+        {"wait": 4000},
+        {"input": {"node": "node-1", "method": "Application.SyncRound", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-1", "path": "spreadMs", "op": "<=", "value": 300}, "label": "几秒后 slew 完成，差距 ≤ 300ms"},
+        {"check": {"node": "*", "path": "backwardJumps", "value": 0}, "label": "slew 期间没有时钟倒退"},
+        {"input": {"node": "node-1", "method": "Application.SetMode", "values": {"step": true}}, "expect": "ok"},
+        {"input": {"node": "node-2", "method": "Application.SetClock", "values": {"offsetMs": 3000, "driftMsPerSec": 20}}, "expect": "ok"},
+        {"input": {"node": "node-1", "method": "Application.SyncRound", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-2", "path": "lastAdjMs", "op": "<=", "value": -1500}, "label": "node-2 需要往回调约 2 秒"},
+        {"check": {"node": "node-2", "path": "backwardJumps", "op": ">=", "value": 1}, "label": "step：node-2 的本地时间倒退了"},
+        {"input": {"node": "node-1", "method": "Application.SyncRound", "values": {}}, "expect": "ok"},
+        {"check": {"node": "node-1", "path": "spreadMs", "op": "<=", "value": 200}, "label": "step 立即对齐（差距 ≤ 200ms），代价是时间不单调"}
+      ]
+    },
+    {
+      "id": "master-crash",
+      "name": "Berkeley · master 崩溃",
+      "settings": {"nodeCount": 4, "latency": 100},
+      "description": "时钟收敛后 master 崩溃，不再有同步轮次，各节点按各自的漂移率重新分开（node-2 +20ms/s、node-3 −15ms/s）。需要选出新的 master（L06 Bully 选举）；这里改为恢复 node-1，它的硬件时钟在宕机期间继续走，轮次恢复后重新收敛。",
+      "steps": [
+        {"until": {"all": [{"node": "node-1", "path": "rounds", "op": ">=", "value": 3}, {"node": "node-1", "path": "spreadMs", "op": "<=", "value": 400}]}, "timeout": 40000, "label": "先收敛"},
+        {"fault": {"kind": "crash", "node": "node-1"}},
+        {"wait": 20000},
+        {"check": {"node": ["node-2", "node-3", "node-4"], "path": "sinceAdjustS", "op": ">=", "value": 18}, "label": "20s 内没有新的调整"},
+        {"check": {"all": [{"node": "node-2", "path": "driftSinceAdjMs", "op": ">=", "value": 250}, {"node": "node-3", "path": "driftSinceAdjMs", "op": "<=", "value": -200}]}, "label": "node-2 与 node-3 朝相反方向漂移，差距超过 450ms"},
+        {"fault": {"kind": "recover", "node": "node-1"}},
+        {"wait": 3000},
+        {"check": {"node": "node-1", "path": "rounds", "value": 0}, "label": "master 重启：轮次等内存状态从零开始"},
+        {"until": {"all": [{"node": "node-1", "path": "rounds", "op": ">=", "value": 2}, {"node": "node-1", "path": "spreadMs", "op": "<=", "value": 400}]}, "timeout": 40000, "label": "master 恢复后重新收敛"}
+      ]
+    }
+  ]
+}

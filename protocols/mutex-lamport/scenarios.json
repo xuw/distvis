@@ -1,0 +1,63 @@
+{
+  "scenarios": [
+    {
+      "id": "concurrent",
+      "name": "Lamport 互斥 · 两个节点同时请求",
+      "settings": {"nodeCount": 3, "latency": 300},
+      "description": "node-1 与 node-3 同时请求，时间戳都是 L=1，1.1 < 1.3。三个节点的请求队列完全一致；node-1 先进入，退出时广播 Release 后 node-3 进入。每次进入 3(n-1) 条消息。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Acquire", "values": {"holdMs": 3000}}, "await": false},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 2000}}, "await": false},
+        {"until": {"node": "*", "path": "queue", "value": ["1.1", "1.3"]}, "timeout": 10000, "label": "三个副本的队列都是 [1.1, 1.3]"},
+        {"until": {"node": "node-1", "path": "role", "value": "critical"}, "timeout": 10000, "label": "队首 1.1 且收到所有更晚消息的 node-1 进入"},
+        {"check": {"node": "node-3", "path": "role", "value": "wanted"}, "label": "node-3 收齐回复但不在队首，继续等待"},
+        {"until": {"all": [{"node": "node-3", "path": "entries", "value": 1}, {"node": "node-1", "path": "entries", "value": 1}]}, "timeout": 20000, "label": "node-1 释放后 node-3 进入"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "任意时刻至多一个 critical"},
+        {"until": {"all": [
+          {"messages": {"method": "Lamport.Request", "op": "==", "value": 4}},
+          {"messages": {"method": "Lamport.Reply", "op": "==", "value": 4}},
+          {"messages": {"method": "Lamport.Release", "op": "==", "value": 4}},
+          {"node": "*", "path": "queue", "value": []}
+        ]}, "timeout": 10000, "label": "两次进入共 2×3(n-1)=12 条消息，队列清空"}
+      ]
+    },
+    {
+      "id": "replicated-queue",
+      "name": "Lamport 互斥 · 复制的优先队列按时间戳排序",
+      "settings": {"nodeCount": 5, "latency": 400},
+      "description": "node-2 持锁期间，时钟较快的 node-5（Tick 30）先申请，node-3 在收到它之前也申请。所有 5 个副本的队列都是 [1.2, 4.3, 33.5]：node-3 虽然晚到却排在前面。",
+      "steps": [
+        {"input": {"node": "node-5", "method": "Application.Tick", "values": {"events": 30}}},
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 5000}}},
+        {"until": {"node": "node-2", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-2 以 1.2 进入"},
+        {"input": {"node": "node-5", "method": "Application.Acquire", "values": {"holdMs": 1500}}, "await": false},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 1500}}, "await": false},
+        {"until": {"node": "*", "path": "queue", "value": ["1.2", "4.3", "33.5"]}, "timeout": 10000, "label": "5 个副本的队列完全相同：[1.2, 4.3, 33.5]"},
+        {"until": {"node": "node-3", "path": "role", "value": "critical"}, "timeout": 15000, "label": "node-2 释放后 node-3（4.3）先进入"},
+        {"check": {"node": "node-5", "path": "role", "value": "wanted"}, "label": "真实时间上先申请的 node-5（33.5）仍在等待"},
+        {"until": {"node": "node-5", "path": "entries", "value": 1}, "timeout": 15000, "label": "node-5 最后进入"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "任意时刻至多一个 critical"},
+        {"until": {"all": [
+          {"messages": {"method": "Lamport.Request", "op": "==", "value": 12}},
+          {"messages": {"method": "Lamport.Reply", "op": "==", "value": 12}},
+          {"messages": {"method": "Lamport.Release", "op": "==", "value": 12}}
+        ]}, "timeout": 10000, "label": "3 次进入 × 3(n-1) = 36 条消息"}
+      ]
+    },
+    {
+      "id": "crash-blocks",
+      "name": "Lamport 互斥 · 任一节点崩溃都会阻塞",
+      "settings": {"nodeCount": 3, "latency": 200},
+      "description": "node-2 从不申请锁，但崩溃后 node-1 收不到它的回复，无法确认没有更早的请求，只能一直等待；node-2 恢复后发送队列里的请求重新送达，node-1 进入。",
+      "steps": [
+        {"fault": {"kind": "crash", "node": "node-2"}},
+        {"input": {"node": "node-1", "method": "Application.Acquire", "values": {"holdMs": 1500}}},
+        {"wait": 6000},
+        {"check": {"all": [{"node": "node-1", "path": "role", "value": "wanted"}, {"node": "node-1", "path": "laterFrom", "value": ["node-3"]}, {"node": "node-1", "path": "queue", "value": ["1.1"]}]}, "label": "node-1 在队首，但缺 node-2 的回复"},
+        {"check": {"node": "node-1", "path": "unsent", "op": ">=", "value": 1}, "label": "发往 node-2 的请求卡在 FIFO 发送队列里"},
+        {"fault": {"kind": "recover", "node": "node-2"}},
+        {"until": {"node": "node-1", "path": "entries", "value": 1}, "timeout": 25000, "label": "node-2 恢复后 node-1 进入"}
+      ]
+    }
+  ]
+}

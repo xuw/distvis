@@ -1,0 +1,89 @@
+{
+  "scenarios": [
+    {
+      "id": "normal",
+      "name": "多数投票 · 无竞争时一次成功",
+      "settings": {"nodeCount": 5, "latency": 200},
+      "description": "5 个节点、m=3。node-2 单独申请：向其余 4 个节点要票（自己的一票本地投），全部 GRANT，一次成功；离开时把 4 张票退回。",
+      "steps": [
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 2000}}},
+        {"until": {"node": "node-2", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-2 得到多数票进入"},
+        {"check": {"node": ["node-1", "node-2", "node-3"], "path": "votedFor", "value": "node-2"}, "label": "投票者记录了自己把票投给 node-2"},
+        {"check": {"all": [{"node": "node-2", "path": "attempts", "value": 1}, {"node": "node-2", "path": "retries", "value": 0}]}, "label": "第一次尝试就成功"},
+        {"until": {"all": [{"node": "node-2", "path": "role", "value": "released"}, {"node": "*", "path": "votedFor", "value": ""}]}, "timeout": 10000, "label": "离开后所有选票被收回"},
+        {"check": {"all": [{"messages": {"method": "Vote.Request", "op": "==", "value": 4}}, {"messages": {"method": "Vote.Release", "op": "==", "value": 4}}]}, "label": "4 个 Request（回复搭载在返回中）+ 4 个 Release"}
+      ]
+    },
+    {
+      "id": "contention",
+      "name": "多数投票 · 全体同时申请：分票、退避与重试",
+      "settings": {"nodeCount": 5, "latency": 300},
+      "description": "5 个节点同时申请：每个节点先投了自己一票，其余请求全被 DENY，没有人过半；大家退还选票、随机退避后重试，直到各自进入。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Acquire", "values": {"holdMs": 800}}, "await": false},
+        {"input": {"node": "node-2", "method": "Application.Acquire", "values": {"holdMs": 800}}, "await": false},
+        {"input": {"node": "node-3", "method": "Application.Acquire", "values": {"holdMs": 800}}, "await": false},
+        {"input": {"node": "node-4", "method": "Application.Acquire", "values": {"holdMs": 800}}, "await": false},
+        {"input": {"node": "node-5", "method": "Application.Acquire", "values": {"holdMs": 800}}, "await": false},
+        {"until": {"node": "any", "path": "retries", "op": ">=", "value": 1}, "timeout": 10000, "label": "出现失败的尝试（分票）"},
+        {"until": {"node": "*", "path": "entries", "value": 1}, "timeout": 75000, "label": "最终每个节点都进入过一次"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "多数派交集保证互斥"},
+        {"check": {"messages": {"method": "Vote.Request", "op": ">", "value": 20}}, "label": "Request 超过 5×4：每轮消息数无上界"}
+      ]
+    },
+    {
+      "id": "forget-vote",
+      "name": "多数投票 · 投票者重启遗忘选票，两人同时进入",
+      "settings": {"nodeCount": 5, "latency": 200},
+      "description": "node-4、node-5 先宕机，node-1 靠 1、2、3 的票（刚好过半）进入并长时间持有。两节点恢复后，投过票的 node-3 崩溃重启、忘了它的票；node-5 再拿到 3、4、5 的票，也进入临界区。",
+      "steps": [
+        {"fault": {"kind": "crash", "node": "node-4"}},
+        {"fault": {"kind": "crash", "node": "node-5"}},
+        {"input": {"node": "node-1", "method": "Application.Acquire", "values": {"holdMs": 40000}}},
+        {"until": {"node": "node-1", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-1 得到 3 票进入（容忍 2 个节点宕机）"},
+        {"check": {"node": "node-1", "path": "votes", "value": ["node-1", "node-2", "node-3"]}, "label": "node-1 持有 1、2、3 的票"},
+        {"fault": {"kind": "recover", "node": "node-4"}},
+        {"fault": {"kind": "recover", "node": "node-5"}},
+        {"until": {"node": ["node-4", "node-5"], "path": "incarnation", "value": 2}, "timeout": 20000, "label": "node-4、node-5 重新上线"},
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"wait": 1000},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"all": [{"node": "node-3", "path": "incarnation", "value": 2}, {"node": "node-3", "path": "votedFor", "value": ""}]}, "timeout": 20000, "label": "node-3 重启后忘了自己投给 node-1"},
+        {"input": {"node": "node-5", "method": "Application.Acquire", "values": {"holdMs": 3000}}},
+        {"until": {"node": "node-5", "path": "role", "value": "critical"}, "timeout": 15000, "label": "node-5 得到 3、4、5 的票也进入"},
+        {"check": {"node": "node-5", "path": "votes", "value": ["node-3", "node-4", "node-5"]}, "label": "两个多数派 {1,2,3} 与 {3,4,5} 只在 node-3 相交"},
+        {"check": {"moreThanOne": {"path": "role", "value": "critical"}}, "label": "违反互斥：曾有两个 critical"}
+      ]
+    },
+    {
+      "id": "persist-vote",
+      "name": "多数投票 · 持久化选票后重启仍然安全",
+      "settings": {"nodeCount": 5, "latency": 200},
+      "description": "同上一场景，但所有节点先开启 Persist：node-3 重启后从磁盘读回投给 node-1 的票，node-5 只拿到 4、5 两票，只能退避重试，直到 node-1 离开。",
+      "steps": [
+        {"input": {"node": "node-1", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"input": {"node": "node-2", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"input": {"node": "node-3", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"input": {"node": "node-4", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"input": {"node": "node-5", "method": "Application.Persist", "values": {"enabled": true}}},
+        {"fault": {"kind": "crash", "node": "node-4"}},
+        {"fault": {"kind": "crash", "node": "node-5"}},
+        {"input": {"node": "node-1", "method": "Application.Acquire", "values": {"holdMs": 15000}}},
+        {"until": {"node": "node-1", "path": "role", "value": "critical"}, "timeout": 10000, "label": "node-1 得到 3 票进入"},
+        {"fault": {"kind": "recover", "node": "node-4"}},
+        {"fault": {"kind": "recover", "node": "node-5"}},
+        {"until": {"node": ["node-4", "node-5"], "path": "incarnation", "value": 2}, "timeout": 20000, "label": "node-4、node-5 重新上线"},
+        {"fault": {"kind": "crash", "node": "node-3"}},
+        {"wait": 1000},
+        {"fault": {"kind": "recover", "node": "node-3"}},
+        {"until": {"node": "node-3", "path": "incarnation", "value": 2}, "timeout": 20000, "label": "node-3 重启"},
+        {"check": {"node": "node-3", "path": "votedFor", "value": "node-1"}, "label": "node-3 从磁盘读回：票仍属于 node-1"},
+        {"input": {"node": "node-5", "method": "Application.Acquire", "values": {"holdMs": 2000}}},
+        {"until": {"node": "node-5", "path": "retries", "op": ">=", "value": 1}, "timeout": 10000, "label": "node-5 只拿到 2 票，退还并重试"},
+        {"check": {"node": "node-5", "path": "role", "value": "wanted"}, "label": "node-5 仍在等待"},
+        {"until": {"node": "node-5", "path": "entries", "value": 1}, "timeout": 40000, "label": "node-1 离开后 node-5 进入"},
+        {"check": {"atMostOne": {"path": "role", "value": "critical"}}, "label": "互斥始终成立"}
+      ]
+    }
+  ]
+}
